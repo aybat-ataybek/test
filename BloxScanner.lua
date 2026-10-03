@@ -31,6 +31,10 @@ setDefault("_warn_actor_risk",       true)
 
 setDefault("_anti_afk",              true)
 
+-- true  = a single device-identifying field (hwid, machineid...) sent to a relay/tunnel host is blocked.
+-- false = needs 2+ such fields (key/licence systems send just hwid, so they are allowed with a notice).
+setDefault("_strict_identity",       false)
+
 setDefault("_icon_asset", "rbxassetid://83768500686029")
 
 setDefault("_whitelist", {
@@ -101,6 +105,26 @@ local function isWhitelisted(host)
     return false
 end
 
+-- Hosts that only proxy public Roblox APIs. GET requests to them are allowed
+-- (cookie / token checks still apply, and POST is still fully checked).
+local READONLY_API_HOSTS = { "roproxy.com" }
+
+local function isReadOnlyApiHost(host)
+    for _, s in ipairs(READONLY_API_HOSTS) do
+        if host == s or (#host > #s and host:sub(-(#s + 1)) == "." .. s) then
+            return true
+        end
+    end
+    return false
+end
+
+local noticed = {}
+local function noticeOnce(key, msg)
+    if noticed[key] then return end
+    noticed[key] = true
+    if getgenv()._log_blocks then warn(msg) end
+end
+
 local function fakeIPv4()
     local a = rnd(1, 223); if a == 127 then a = 128 end
     return ("%d.%d.%d.%d"):format(a, rnd(0, 255), rnd(0, 255), rnd(1, 254))
@@ -156,7 +180,7 @@ local BLACKLIST = {
     "logip.net", "trackip.net", "ip-tracker.net", "ipgrabber", "ipgraber",
     "iplis.ru", "iplog.co", "maper.info", "ps3cfw.com", "wl.gl", "bc.ax",
     "ed.tc", "ezstat.ru", "02ip.ru", "browserleaks", "whoer", "ipleak",
-    "canarytokens", "roproxy",
+    "canarytokens",
     "roware.space", "globalcheats.cc", "darkscripts", "egorikusa",
     "hookbin", "pipedream", "webhook-test.com",
     "webhook.site", "webhook.in", "hook.io",
@@ -464,16 +488,20 @@ local KnownExfilHosts = {
     ["proxy-plum-beta.vercel.app"] = true,
 }
 
-local SensitiveBodyFields = {
-
+-- STRONG: one match is enough to block (credentials / session data).
+local StrongBodyFields = {
     "roblosec" .. "urity", "getauthticket", "authticket", "auth_ticket",
     ".robloxsecurity", "securitytoken", "x-csrf-token", "csrftoken",
     "cookie", "cookies", "sessionid", "session_id", "refreshtoken",
     "accesstoken", "access_token",
+}
 
+-- WEAK: identify the device / account but are also sent by normal key and
+-- licence systems. One match = allowed + notice; two or more = blocked
+-- (or one match when getgenv()._strict_identity = true).
+local WeakBodyFields = {
     "clientid", "client_id", "sessionlogid", "playsessionid",
     "hwid", "hardwareid", "machineid", "identityhash",
-
     "inventory", "backpack_items", "iteminventory", "ownedgamepasses",
     "collectibles", "limiteds", "totalrap", "networth",
 }
@@ -522,14 +550,26 @@ local function countFieldHits(bodyStr, fields)
     return hits, firstHit
 end
 
-local function webhookBodyVerdict(bodyStr)
-    local sensitive, which = countFieldHits(bodyStr, SensitiveBodyFields)
-    if sensitive > 0 then
+-- returns: shouldBlock, reason, weakFieldSeen
+-- strictWeak = true is used for real webhook endpoints (Discord, Telegram...)
+-- where even a single identifying field is suspicious.
+local function webhookBodyVerdict(bodyStr, strictWeak)
+    local strong, which = countFieldHits(bodyStr, StrongBodyFields)
+    if strong > 0 then
         return true, "sensitive field in body: \"" .. tostring(which) ..
-                     "\" (total matches: " .. sensitive .. ")"
+                     "\" (total matches: " .. strong .. ")", nil
     end
 
-    return false, nil
+    local weak, weakWhich = countFieldHits(bodyStr, WeakBodyFields)
+    local threshold = (strictWeak or getgenv()._strict_identity) and 1 or 2
+    if weak >= threshold then
+        return true, "device-identifying field in body: \"" .. tostring(weakWhich) ..
+                     "\" (total matches: " .. weak .. ")", nil
+    end
+    if weak > 0 then
+        return false, nil, weakWhich
+    end
+    return false, nil, nil
 end
 
 local LocationFields = {
@@ -684,45 +724,270 @@ local function downloadImage(url)
     return nil
 end
 
-local CONFIG = {
-    SLIDE_IN_TIME = 0.4,
-    SLIDE_OUT_TIME = 0.05,
-    SCALE_TIME = 0.11,
-    SCALE_DOWN = 0.96,
-    START_Y = -1,
-    END_Y = 59,
-    DEFAULT_DURATION = 2,
-    BACKGROUND_COLOR = Color3.fromHex("#23262C"),
-    TEXT_COLOR = Color3.fromRGB(247, 247, 248),
-    WIDTH_OFFSET = -24,
-    TITLE_SIZE = 20,
-    SUBTITLE_SIZE = 15,
-    ICON_SIZE = 40,
-    ICON_TEXT_SIZE = 26,
-    REMOVE_PREVIOUS = true,
-    CORNER_RADIUS = 6,
-    MIN_HEIGHT = 55,
-    TOAST_HEIGHT_FULL = 77,
-    TOAST_HEIGHT_SMALL = 55,
-    DEFAULT_ICON = getgenv()._icon_asset or "rbxassetid://83768500686029",
+local ToastConfig = {
+    ["Slide In Time"] = 0.4,
+    ["Slide Out Time"] = 0.05,
+    ["Scale Time"] = 0.11,
+    ["Scale Down"] = 0.96,
+    ["Start Y"] = -1,
+    ["End Y"] = 59,
+    ["Default Duration"] = 2,
+    ["Background Color"] = Color3.fromHex("#23262C"),
+    ["Text Color"] = Color3.fromRGB(247,247,248),
+    ["Width Offset"] = -24,
+    ["Title Size"] = 20,
+    ["Subtitle Size"] = 15,
+    ["Icon Size"] = 36,
+    ["Icon Text Size"] = 26,
+    ["Remove Previous"] = false,
+    ["Corner Radius"] = 6,
+    ["Min Height"] = 60,
+    ["Thumb Size"] = 150
+}
+
+local ThumbTypes = {
+    ["Asset"] = { w = 150, h = 150, type = "Asset" },
+    ["Avatar"] = { w = 150, h = 150, type = "Avatar" },
+    ["Avatar Bust"] = { w = 150, h = 150, type = "AvatarBust" },
+    ["Avatar Head Shot"] = { w = 150, h = 150, type = "AvatarHeadShot" },
+    ["Badge Icon"] = { w = 150, h = 150, type = "BadgeIcon" },
+    ["Bundle Thumbnail"] = { w = 150, h = 150, type = "BundleThumbnail" },
+    ["Font Family"] = { w = 150, h = 150, type = "FontFamily" },
+    ["Game Icon"] = { w = 150, h = 150, type = "GameIcon" },
+    ["Game Pass"] = { w = 150, h = 150, type = "GamePass" },
+    ["Game Thumbnail"] = { w = 256, h = 144, type = "GameThumbnail" },
+    ["Group Icon"] = { w = 150, h = 150, type = "GroupIcon" },
+    ["Outfit"] = { w = 150, h = 150, type = "Outfit" },
+}
+
+local ThumbTypeAliases = {
+    ["Asset"] = "Asset", ["Image"] = "Asset", ["Decal"] = "Asset", ["Audio"] = "Asset",
+    ["Mesh"] = "Asset", ["Model"] = "Asset", ["Animation"] = "Asset", ["Video"] = "Asset",
+    ["Plugin"] = "Asset", ["Tshirt"] = "Asset", ["Shirt"] = "Asset", ["Pants"] = "Asset",
+    ["Hat"] = "Asset", ["Accessory"] = "Asset", ["Face"] = "Asset", ["Head"] = "Asset", ["Gear"] = "Asset",
+    ["Avatar"] = "Avatar", ["User"] = "Avatar", ["Player"] = "Avatar",
+    ["Avatar Bust"] = "Avatar Bust", ["Bust"] = "Avatar Bust",
+    ["Avatar Head Shot"] = "Avatar Head Shot", ["Headshot"] = "Avatar Head Shot",
+    ["Badge"] = "Badge Icon", ["Badge Icon"] = "Badge Icon",
+    ["Bundle"] = "Bundle Thumbnail", ["Bundle Thumbnail"] = "Bundle Thumbnail",
+    ["Font"] = "Font Family", ["Font Family"] = "Font Family",
+    ["Game"] = "Game Icon", ["Game Icon"] = "Game Icon", ["Experience"] = "Game Icon",
+    ["Game Pass"] = "Game Pass", ["Pass"] = "Game Pass",
+    ["Game Thumbnail"] = "Game Thumbnail", ["Place"] = "Game Thumbnail",
+    ["Group"] = "Group Icon", ["Group Icon"] = "Group Icon", ["Outfit"] = "Outfit",
 }
 
 local currentToast = nil
-local _lastToastKey = nil
-local _lastToastTime = 0
+local imageCounter = 0
+
+local function ensureToastFolder(path)
+    pcall(function()
+        if not isfolder(path) then
+            makefolder(path)
+        end
+    end)
+end
+
+local function autoDeleteToastFile(filepath)
+    task.delay(10, function()
+        pcall(function()
+            if isfile(filepath) then
+                delfile(filepath)
+            end
+        end)
+    end)
+end
+
+local function toNumberId(value)
+    if type(value) == "number" then
+        return math.floor(value)
+    end
+    if type(value) ~= "string" then
+        return nil
+    end
+    local n = value:match("(%d+)")
+    return n and tonumber(n) or nil
+end
+
+local function normalizeThumbType(thumbType)
+    if type(thumbType) ~= "string" or thumbType == "" then
+        return nil
+    end
+    if ThumbTypes[thumbType] then
+        return thumbType
+    end
+    local normalized = thumbType:lower():gsub("[%s_%-]", "")
+    for aliasKey, canonical in pairs(ThumbTypeAliases) do
+        if aliasKey:lower():gsub("[%s_%-]", "") == normalized then
+            return canonical
+        end
+    end
+    return nil
+end
+
+local function makeRbxThumb(thumbType, id, size)
+    local info = ThumbTypes[thumbType]
+    if not info or not id then
+        return nil
+    end
+    local rbxType = info.type or thumbType:gsub("%s", "")
+    local w, h = info.w, info.h
+    if type(size) == "number" then
+        w, h = size, size
+    elseif type(size) == "table" then
+        w = size.w or size.x or size[1] or w
+        h = size.h or size.y or size[2] or h
+    end
+    return string.format("rbxthumb://type=%s&id=%d&w=%d&h=%d", rbxType, id, w, h)
+end
+
+local function extractIdFromRobloxUrl(url)
+    local id = url:match("roblox%.com/[^%s]*%a+/(%d+)")
+        or url:match("[?&]id=(%d+)")
+        or url:match("/asset/%?id=(%d+)")
+    return id and tonumber(id) or nil
+end
+
+local function inferThumbTypeFromUrl(url)
+    local lower = url:lower()
+    if lower:match("/users/") or lower:match("/user%.aspx") or lower:match("userid=") then
+        return "Avatar Head Shot"
+    end
+    if lower:match("/groups/") or lower:match("groupid=") then
+        return "Group Icon"
+    end
+    if lower:match("/badges/") or lower:match("badgeid=") then
+        return "Badge Icon"
+    end
+    if lower:match("/game%-pass") or lower:match("/gamepass") or lower:match("gamepass") then
+        return "Game Pass"
+    end
+    if lower:match("/bundles/") then
+        return "Bundle Thumbnail"
+    end
+    if lower:match("/games/") or lower:match("/experiences/") then
+        return "Game Icon"
+    end
+    return "Asset"
+end
+
+local function isContentScheme(value)
+    if type(value) ~= "string" then
+        return false
+    end
+    return value:match("^rbxassetid://")
+        or value:match("^rbxasset://")
+        or value:match("^rbxthumb://")
+        or value:match("^rbxgameasset://")
+        or value:match("^rbxhttp://")
+        or value:match("^rbxalias://")
+end
+
+local function isHttpUrl(value)
+    return type(value) == "string" and value:match("^https?://") ~= nil
+end
+
+local function isRobloxHost(url)
+    local lower = url:lower()
+    return lower:match("roblox%.com") ~= nil or lower:match("rbxcdn%.com") ~= nil
+end
+
+local function resolveIconContent(config)
+    local icon = config.icon
+    local thumbType = normalizeThumbType(config.iconType or config.thumbType or config.assetType or config.AssetType)
+    local thumbSize = config.iconThumbSize or config.thumbSize or ToastConfig["Thumb Size"]
+
+    if type(icon) == "number" then
+        if thumbType then
+            return makeRbxThumb(thumbType, icon, thumbSize)
+        end
+        return "rbxassetid://" .. tostring(icon)
+    end
+
+    if type(icon) ~= "string" then
+        return nil, "text"
+    end
+
+    if isContentScheme(icon) then
+        if thumbType then
+            local id = toNumberId(icon)
+            local built = id and makeRbxThumb(thumbType, id, thumbSize)
+            if built then
+                return built
+            end
+        end
+        return icon
+    end
+
+    if isHttpUrl(icon) then
+        if isRobloxHost(icon) then
+            local id = extractIdFromRobloxUrl(icon)
+            local inferred = thumbType or inferThumbTypeFromUrl(icon)
+            if id then
+                return makeRbxThumb(inferred, id, thumbSize)
+            end
+        end
+        return icon, "url"
+    end
+
+    if icon:match("^%d+$") then
+        local id = tonumber(icon)
+        if thumbType then
+            return makeRbxThumb(thumbType, id, thumbSize)
+        end
+        return "rbxassetid://" .. icon
+    end
+
+    local looseId = icon:match("rbxassetid:?/*(%d+)") or icon:match("asset/?id=(%d+)")
+    if looseId then
+        local id = tonumber(looseId)
+        if thumbType then
+            return makeRbxThumb(thumbType, id, thumbSize)
+        end
+        return "rbxassetid://" .. looseId
+    end
+
+    return icon, "text"
+end
+
+local function createImageIcon(image, iconColor)
+    local iconObj = Instance.new("ImageLabel")
+    iconObj.Name = "ToastIcon"
+    iconObj.Image = image
+    iconObj.ImageColor3 = iconColor or Color3.new(1, 1, 1)
+    iconObj.BackgroundTransparency = 1
+    iconObj.Size = UDim2.new(0, ToastConfig["Icon Size"], 0, ToastConfig["Icon Size"])
+    iconObj.ScaleType = Enum.ScaleType.Fit
+    iconObj.LayoutOrder = 1
+    return iconObj
+end
+
+local function loadUrlIcon(url, iconColor)
+    local req = http_request or (syn and syn.request) or request
+    if not req then
+        return createImageIcon(url, iconColor)
+    end
+
+    local folderPath = "./temp/img"
+    ensureToastFolder(folderPath)
+    imageCounter = imageCounter + 1
+    local filename = folderPath .. "/" .. imageCounter .. ".png"
+    local success, res = pcall(function()
+        return req({ Url = url, Method = "GET" }).Body
+    end)
+    if success and res then
+        writefile(filename, res)
+        autoDeleteToastFile(filename)
+        local asset = getcustomasset(filename)
+        return createImageIcon(asset, iconColor)
+    end
+    return nil
+end
 
 local function NotifyToast(config)
     config = config or {}
 
-    local dedupKey = tostring(config.title) .. "||" .. tostring(config.content or config.subtitle)
-    local now = tick()
-    if dedupKey == _lastToastKey and (now - _lastToastTime) < 1 then
-        return
-    end
-    _lastToastKey = dedupKey
-    _lastToastTime = now
-
-    if CONFIG.REMOVE_PREVIOUS and currentToast and currentToast.Parent then
+    if ToastConfig["Remove Previous"] and currentToast and currentToast.Parent then
         currentToast:Destroy()
     end
 
@@ -740,34 +1005,37 @@ local function NotifyToast(config)
     currentToast = screenGui
 
     local container = Instance.new("TextButton")
+    container.Name = "ToastContainer"
     container.AnchorPoint = Vector2.new(0.5, 0.5)
-    container.Position = UDim2.new(0.5, 0, 0, CONFIG.START_Y)
+    container.Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
     container.BackgroundTransparency = 1
     container.Text = ""
     container.Parent = screenGui
 
     local sizeConstraint = Instance.new("UISizeConstraint")
     sizeConstraint.MaxSize = Vector2.new(400, math.huge)
+    sizeConstraint.MinSize = Vector2.new(0, ToastConfig["Min Height"])
     sizeConstraint.Parent = container
 
     local bg = Instance.new("Frame")
-    bg.BackgroundColor3 = CONFIG.BACKGROUND_COLOR
+    bg.Name = "Toast"
+    bg.BackgroundColor3 = ToastConfig["Background Color"]
     bg.BackgroundTransparency = 0
     bg.BorderSizePixel = 0
-    bg.Size = UDim2.new(1, 0, 1, 0)
+    bg.Size = UDim2.new(1,0,1,0)
     bg.Parent = container
 
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, CONFIG.CORNER_RADIUS)
+    corner.CornerRadius = UDim.new(0, ToastConfig["Corner Radius"])
     corner.Parent = bg
 
     local innerFrame = Instance.new("Frame")
     innerFrame.BackgroundTransparency = 1
-    innerFrame.Size = UDim2.new(1, 0, 1, 0)
+    innerFrame.Size = UDim2.new(1,0,1,0)
     innerFrame.Parent = bg
 
     local hList = Instance.new("UIListLayout")
-    hList.Padding = UDim.new(0, 12)
+    hList.Padding = UDim.new(0,12)
     hList.FillDirection = Enum.FillDirection.Horizontal
     hList.SortOrder = Enum.SortOrder.LayoutOrder
     hList.VerticalAlignment = Enum.VerticalAlignment.Center
@@ -775,19 +1043,19 @@ local function NotifyToast(config)
 
     local msgFrame = Instance.new("Frame")
     msgFrame.BackgroundTransparency = 1
-    msgFrame.Size = UDim2.new(1, 0, 1, 0)
+    msgFrame.Size = UDim2.new(1,0,1,0)
     msgFrame.LayoutOrder = 2
     msgFrame.Parent = innerFrame
 
     local vList = Instance.new("UIListLayout")
-    vList.Padding = UDim.new(0, 12)
+    vList.Padding = UDim.new(0,12)
     vList.SortOrder = Enum.SortOrder.LayoutOrder
     vList.VerticalAlignment = Enum.VerticalAlignment.Center
     vList.Parent = msgFrame
 
     local textFrame = Instance.new("Frame")
     textFrame.BackgroundTransparency = 1
-    textFrame.Size = UDim2.new(1, -48, 0, 0)
+    textFrame.Size = UDim2.new(1,-48,0,0)
     textFrame.AutomaticSize = Enum.AutomaticSize.Y
     textFrame.Parent = msgFrame
 
@@ -797,81 +1065,93 @@ local function NotifyToast(config)
     vList2.Parent = textFrame
 
     local title = Instance.new("TextLabel")
+    title.Name = "ToastTitle"
     title.FontFace = Font.new("rbxasset://fonts/families/BuilderSans.json", Enum.FontWeight.Bold)
-    title.TextColor3 = CONFIG.TEXT_COLOR
-    title.TextSize = CONFIG.TITLE_SIZE
+    title.TextColor3 = ToastConfig["Text Color"]
+    title.TextSize = ToastConfig["Title Size"]
     title.TextWrapped = true
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.BackgroundTransparency = 1
-    title.Size = UDim2.new(1, 0, 0, 0)
+    title.Size = UDim2.new(1,0,0,0)
     title.AutomaticSize = Enum.AutomaticSize.Y
     title.RichText = true
     title.LayoutOrder = 1
-    title.Text = config.title or ""
     title.Parent = textFrame
 
     local subtitle = Instance.new("TextLabel")
+    subtitle.Name = "ToastSubtitle"
     subtitle.FontFace = Font.new("rbxasset://fonts/families/BuilderSans.json")
-    subtitle.TextColor3 = CONFIG.TEXT_COLOR
-    subtitle.TextSize = CONFIG.SUBTITLE_SIZE
+    subtitle.TextColor3 = ToastConfig["Text Color"]
+    subtitle.TextSize = ToastConfig["Subtitle Size"]
     subtitle.TextWrapped = true
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
     subtitle.BackgroundTransparency = 1
-    subtitle.Size = UDim2.new(1, 0, 0, 0)
+    subtitle.Size = UDim2.new(1,0,0,0)
     subtitle.AutomaticSize = Enum.AutomaticSize.Y
     subtitle.RichText = true
     subtitle.LayoutOrder = 2
-    subtitle.Text = config.content or config.subtitle or ""
     subtitle.Parent = textFrame
 
     local padding = Instance.new("UIPadding")
-    padding.PaddingLeft = UDim.new(0, 12)
-    padding.PaddingRight = UDim.new(0, 12)
-    padding.PaddingTop = UDim.new(0, 12)
-    padding.PaddingBottom = UDim.new(0, 12)
+    padding.PaddingLeft = UDim.new(0,12)
+    padding.PaddingRight = UDim.new(0,12)
+    padding.PaddingTop = UDim.new(0,12)
+    padding.PaddingBottom = UDim.new(0,12)
     padding.Parent = innerFrame
 
     local scaler = Instance.new("UIScale")
     scaler.Scale = 1
     scaler.Parent = container
 
+    title.Text = config.title or ""
+    subtitle.Text = config.content or config.subtitle or ""
+
+    local duration = config.duration or ToastConfig["Default Duration"]
+    local callback = config.callback or function() end
+
     local showIcon = config.icon and config.icon ~= ""
-    local iconObj
+    local iconObj = innerFrame:FindFirstChild("ToastIcon")
+    if iconObj then iconObj:Destroy() end
+
+    local iconColor = config.iconColor
+    if type(iconColor) == "string" and iconColor:match("^#") then
+        iconColor = Color3.fromHex(iconColor)
+    end
 
     if showIcon then
-        local isUrl = type(config.icon) == "string" and config.icon:match("^https?://")
-        local isAsset = type(config.icon) == "string" and (config.icon:match("^rbxassetid://") or config.icon:match("^rbxasset://")) or type(config.icon) == "number"
+        local content, kind = resolveIconContent(config)
 
-        if isUrl then
-            local asset = downloadImage(config.icon)
-            if asset then
-                iconObj = Instance.new("ImageLabel")
-                iconObj.Image = asset
-                iconObj.BackgroundTransparency = 1
-                iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
-                iconObj.LayoutOrder = 1
-                iconObj.Parent = innerFrame
-            end
-        elseif isAsset then
-            local id = type(config.icon) == "number" and "rbxassetid://" .. config.icon or config.icon
-            iconObj = Instance.new("ImageLabel")
-            iconObj.Image = id
-            iconObj.BackgroundTransparency = 1
-            iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
-            iconObj.LayoutOrder = 1
-            iconObj.Parent = innerFrame
-        else
+        if kind == "url" then
+            iconObj = loadUrlIcon(content, iconColor)
+        elseif kind == "text" then
             iconObj = Instance.new("TextLabel")
+            iconObj.Name = "ToastIcon"
             iconObj.FontFace = Font.new("rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json", Enum.FontWeight.Bold)
-            iconObj.Text = config.icon
-            iconObj.TextColor3 = CONFIG.TEXT_COLOR
-            iconObj.TextSize = CONFIG.ICON_TEXT_SIZE
+            iconObj.Text = tostring(content or config.icon)
+            iconObj.TextColor3 = iconColor or ToastConfig["Text Color"]
+            iconObj.TextSize = ToastConfig["Icon Text Size"]
             iconObj.TextXAlignment = Enum.TextXAlignment.Center
             iconObj.TextYAlignment = Enum.TextYAlignment.Center
             iconObj.BackgroundTransparency = 1
-            iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
+            iconObj.Size = UDim2.new(0, ToastConfig["Icon Size"], 0, ToastConfig["Icon Size"])
             iconObj.LayoutOrder = 1
+        elseif content then
+            iconObj = createImageIcon(content, iconColor)
+        end
+
+        if iconObj then
             iconObj.Parent = innerFrame
+
+            local radius = config.iconCornerRadius or config.iconRadius or config.IconCorner or config.IconRadius or 0
+            if radius ~= 0 then
+                local iconCorner = Instance.new("UICorner")
+                if radius == true or radius == 0.5 or radius >= 18 then
+                    iconCorner.CornerRadius = UDim.new(0.5, 0)
+                else
+                    iconCorner.CornerRadius = UDim.new(0, radius)
+                end
+                iconCorner.Parent = iconObj
+            end
         end
     end
 
@@ -880,63 +1160,88 @@ local function NotifyToast(config)
 
     local hasTitle = title.Text ~= ""
     local hasSubtitle = subtitle.Text ~= ""
-    local toastHeight = (hasTitle and hasSubtitle) and CONFIG.TOAST_HEIGHT_FULL or CONFIG.TOAST_HEIGHT_SMALL
-    toastHeight = math.max(toastHeight, CONFIG.MIN_HEIGHT)
+    title.Visible = hasTitle
+    subtitle.Visible = hasSubtitle
 
-    container.Size = UDim2.new(1, CONFIG.WIDTH_OFFSET, 0, toastHeight)
-    bg.Size = UDim2.new(1, 0, 1, 0)
-    innerFrame.Size = UDim2.new(1, 0, 1, 0)
-    msgFrame.Size = UDim2.new(1, 0, 1, 0)
+    container.Size = UDim2.new(1, ToastConfig["Width Offset"], 0, 0)
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    bg.AutomaticSize = Enum.AutomaticSize.Y
+    innerFrame.AutomaticSize = Enum.AutomaticSize.Y
+    msgFrame.AutomaticSize = Enum.AutomaticSize.Y
 
-    local minHeightConstraint = Instance.new("UISizeConstraint")
-    minHeightConstraint.MinSize = Vector2.new(0, CONFIG.MIN_HEIGHT)
-    minHeightConstraint.Parent = container
+    screenGui.Enabled = true
+    container.Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
+    scaler.Scale = 1
 
     task.wait()
 
     local actualHeight = container.AbsoluteSize.Y
-    local dynamicShowY = CONFIG.END_Y / 2.818 + (actualHeight / 2)
+    local dynamicShowY = ToastConfig["End Y"]/2.818 + (actualHeight / 2)
 
-    container.Position = UDim2.new(0.5, 0, 0, CONFIG.START_Y)
+    container.Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
 
-    TweenService:Create(container, TweenInfo.new(CONFIG.SLIDE_IN_TIME, Enum.EasingStyle.Quint), {
-        Position = UDim2.new(0.5, 0, 0, dynamicShowY)
+    TweenService:Create(container, TweenInfo.new(ToastConfig["Slide In Time"], Enum.EasingStyle.Quint), {
+        Position = UDim2.new(0.5,0,0,dynamicShowY)
     }):Play()
 
     local function hideToast()
-        TweenService:Create(container, TweenInfo.new(CONFIG.SLIDE_OUT_TIME, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
-            Position = UDim2.new(0.5, 0, 0, CONFIG.START_Y)
+        TweenService:Create(container, TweenInfo.new(ToastConfig["Slide Out Time"], Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
+            Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
         }):Play()
-        task.delay(CONFIG.SLIDE_OUT_TIME, function()
+        task.delay(ToastConfig["Slide Out Time"], function()
             if currentToast == screenGui then currentToast = nil end
             screenGui:Destroy()
         end)
     end
 
-    task.delay(config.duration or CONFIG.DEFAULT_DURATION, function()
-        if screenGui and screenGui.Parent then hideToast() end
+    task.delay(duration, function()
+        if screenGui and screenGui.Parent then
+            hideToast()
+        end
     end)
 
     container.MouseButton1Down:Connect(function()
-        TweenService:Create(scaler, TweenInfo.new(CONFIG.SCALE_TIME), { Scale = CONFIG.SCALE_DOWN }):Play()
+        TweenService:Create(scaler, TweenInfo.new(ToastConfig["Scale Time"]), {Scale = ToastConfig["Scale Down"]}):Play()
     end)
 
     container.MouseButton1Up:Connect(function()
-        TweenService:Create(scaler, TweenInfo.new(CONFIG.SCALE_TIME), { Scale = 1 }):Play()
+        TweenService:Create(scaler, TweenInfo.new(ToastConfig["Scale Time"]), {Scale = 1}):Play()
     end)
 
     container.MouseButton1Click:Connect(function()
         hideToast()
-        if config.callback then config.callback() end
+        callback()
     end)
 
     container.MouseLeave:Connect(function()
-        TweenService:Create(scaler, TweenInfo.new(CONFIG.SCALE_TIME), { Scale = 1 }):Play()
+        TweenService:Create(scaler, TweenInfo.new(ToastConfig["Scale Time"]), {Scale = 1}):Play()
     end)
 end
 
+-- Не перезаписываем уже существующий getgenv().NotifyToast.
+-- BloxScanner использует локальную NotifyToast, а глобальная функция сохраняется.
+if getgenv().NotifyToast == nil then
+    getgenv().NotifyToast = NotifyToast
+end
+
+
+local lastLog, lastLogN = {}, 0
+
 local function logBlock(tag, url)
     if not getgenv()._log_blocks then return end
+
+    -- the same block repeated within 3 seconds is shown only once
+    do
+        local key = tostring(tag) .. "|" .. tostring(url)
+        local now = os.clock()
+        if lastLog[key] and now - lastLog[key] < 3 then
+            lastWebhookReason = nil
+            return
+        end
+        lastLogN = lastLogN + 1
+        if lastLogN > 200 then lastLog, lastLogN = {}, 1 end
+        lastLog[key] = now
+    end
     local source = getCallingScriptName()
 
     local consoleTitle
@@ -1082,6 +1387,15 @@ isBlocked = function(url, body, headers, isPost)
         return false, nil
     end
 
+    -- read-only Roblox API proxies (roproxy): allow plain GET lookups
+    if not isPost and isReadOnlyApiHost(host) then
+        local qs = pl:match("%?(.*)$")
+        local bad = qs and webhookBodyVerdict(qs, true)
+        if not bad then
+            return false, nil
+        end
+    end
+
     if isExactBlacklisted(host) then
         return true, "LOGGER"
     end
@@ -1117,12 +1431,14 @@ isBlocked = function(url, body, headers, isPost)
 
         if isRelayHost then
 
-            local shouldBlock, why = webhookBodyVerdict(bl)
+            local shouldBlock, why, weak = webhookBodyVerdict(bl)
 
             if not shouldBlock and not isPost then
                 local qs = pl:match("%?(.*)$")
                 if qs then
-                    shouldBlock, why = webhookBodyVerdict(qs)
+                    local qsWeak
+                    shouldBlock, why, qsWeak = webhookBodyVerdict(qs)
+                    weak = weak or qsWeak
                     if shouldBlock then
                         why = "GET query string → " .. tostring(why)
                     end
@@ -1132,6 +1448,11 @@ isBlocked = function(url, body, headers, isPost)
             if shouldBlock then
                 lastWebhookReason = why
                 return true, "RELAY"
+            end
+            if weak then
+                noticeOnce("weak:" .. host,
+                    ("Notice: %s received a device-identifying field (\"%s\"). Allowed - this looks like a key/licence system. "
+                     .. "Set getgenv()._strict_identity = true to block this kind of request."):format(host, tostring(weak)))
             end
             if getgenv()._verbose_soft_warnings then
                 warn(("Allowed request to relay platform (no sensitive data): %s (%s)")
@@ -1151,7 +1472,7 @@ isBlocked = function(url, body, headers, isPost)
                     return true, "WEBHOOK"
                 end
 
-                local shouldBlock, why = webhookBodyVerdict(bl)
+                local shouldBlock, why = webhookBodyVerdict(bl, true)
                 if shouldBlock then
                     lastWebhookReason = why
                     return true, "WEBHOOK"
@@ -1169,8 +1490,13 @@ isBlocked = function(url, body, headers, isPost)
         hostLabels[#hostLabels + 1] = label
     end
 
+    local paddedHost = "." .. host .. "."
     for _, p in ipairs(BLACKLIST) do
         if host == p or host:sub(-(#p + 1)) == "." .. p then
+            return true, "LOGGER"
+        end
+        -- multi-label entries ("checkip.amazonaws") match as whole labels inside the host
+        if sfind(p, ".", 1, true) and sfind(paddedHost, "." .. p .. ".", 1, true) then
             return true, "LOGGER"
         end
         for _, label in ipairs(hostLabels) do
@@ -1205,11 +1531,23 @@ isBlocked = function(url, body, headers, isPost)
     return false, nil
 end
 
+local function looksLikeLuaCode(s)
+    local head = s:sub(1, 4000)
+    if sfind(head, "game:GetService", 1, true) or sfind(head, "getgenv()", 1, true)
+       or sfind(head, "loadstring", 1, true) or sfind(head, "return function", 1, true) then
+        return true
+    end
+    return sfind(head, "local ", 1, true) ~= nil
+       and (sfind(head, "function", 1, true) ~= nil or sfind(head, "\nend", 1, true) ~= nil)
+end
+
 local function sanitizeBody(bodyStr, host)
     if type(bodyStr) ~= "string" or bodyStr == "" then return bodyStr end
     if not getgenv()._sanitize_ip then return bodyStr end
 
     if host and isWhitelisted(host) then return bodyStr end
+    -- scripts fetched for loadstring must stay byte-for-byte intact
+    if looksLikeLuaCode(bodyStr) then return bodyStr end
 
     local ipv4, ipv6 = fakeIPv4(), fakeIPv6()
 
@@ -1286,87 +1624,138 @@ local function sanitizeBody(bodyStr, host)
     return out
 end
 
+-- Lower-cases the code and undoes cheap obfuscation tricks that hide
+-- signatures: "a".."b" concatenation, \ddd / \xHH escapes, string.char(...).
+local function codeNormalize(src)
+    local ok, res = pcall(function()
+        local s = src:lower()
+        if #s > 3000000 then return s end
+        s = gsub(s, "\\x(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+        s = gsub(s, "\\(%d%d?%d?)", function(d)
+            local n = tonumber(d)
+            if n and n < 256 then return string.char(n) end
+        end)
+        s = gsub(s, "string%.char%s*%(([%d%s,]+)%)", function(list)
+            local parts = {}
+            for n in list:gmatch("%d+") do
+                local v = tonumber(n)
+                if not v or v > 255 then return nil end
+                parts[#parts + 1] = string.char(v)
+            end
+            return '"' .. table.concat(parts) .. '"'
+        end)
+        for _ = 1, 4 do
+            local before = s
+            s = gsub(s, "[\"']%s*%.%.%s*[\"']", "")
+            if s == before then break end
+        end
+        return s
+    end)
+    if ok and type(res) == "string" then return res end
+    return src:lower()
+end
+
+local function codeSha256(code)
+    if type(crypt) == "table" and type(crypt.hash) == "function" then
+        local ok, h = pcall(crypt.hash, code, "sha256")
+        if ok and type(h) == "string" then return h:lower() end
+    end
+    return nil
+end
+
 if getgenv()._scan_loadstring and hookfunction and type(loadstring) == "function" then
     local origLoadstring
-    origLoadstring = hookfunction(loadstring, newcclosure(function(code, chunkname)
-        local codeStr = tostring(code):lower()
-        local source = getCallingScriptName()
 
-        if type(code) == "string" then
-            for _, w in ipairs(getgenv()._loadstring_whitelist or {}) do
-                if type(w) == "string" and w ~= "" and sfind(codeStr, slower(w), 1, true) then
-                    return origLoadstring(code, chunkname)
+    local function blockCode(reason)
+        local source = getCallingScriptName()
+        warn("╔═════════━━━ • ━━━═════════╗")
+        warn("[ STEALER - BLOCKED ]")
+        warn("Time : " .. os.date("%H:%M:%S"))
+        warn("Source script : " .. source)
+        warn("Reason : " .. reason)
+        warn("╚═════════━━━ • ━━━═════════╝")
+        NotifyToast({
+            title = "STEALER - BLOCKED",
+            content = "Learn more in the console...",
+            duration = 5,
+            icon = CONFIG.DEFAULT_ICON
+        })
+        return newcclosure(function() end)
+    end
+
+    origLoadstring = hookfunction(loadstring, newcclosure(function(code, chunkname)
+        if not getgenv()._scan_loadstring or type(code) ~= "string" then
+            return origLoadstring(code, chunkname)
+        end
+
+        -- Whitelist:
+        --   "sha256:<hex>"  -> exact script, skips ALL checks (needs crypt.hash)
+        --   any other text  -> must appear in the first 300 chars; skips only the
+        --                      soft (warning-only) checks. Hard signatures always run,
+        --                      so a stealer cannot pass by pasting a trusted word.
+        local softTrusted = false
+        local wl = getgenv()._loadstring_whitelist
+        if type(wl) == "table" and #wl > 0 then
+            local head = slower(code:sub(1, 300))
+            local hash
+            for _, w in ipairs(wl) do
+                if type(w) == "string" and w ~= "" then
+                    if slower(w:sub(1, 7)) == "sha256:" then
+                        if hash == nil then hash = codeSha256(code) or false end
+                        if hash and hash == slower(w:sub(8)) then
+                            return origLoadstring(code, chunkname)
+                        end
+                    elseif sfind(head, slower(w), 1, true) then
+                        softTrusted = true
+                    end
                 end
             end
         end
+
+        local norm = codeNormalize(code)
+        local compact = gsub(norm, "[%s%c]", "")
 
         for _, word in ipairs(CodeBlacklistHard) do
-            if sfind(codeStr, word, 1, true) then
-                warn("╔═════════━━━ • ━━━═════════╗")
-                warn("[ STEALER - BLOCKED ]")
-                warn("Time : " .. os.date("%H:%M:%S"))
-                warn("Source script : " .. source)
-                warn("Reason : hard signature \"" .. word .. "\"")
-                warn("╚═════════━━━ • ━━━═════════╝")
-                NotifyToast({
-                    title = "STEALER - BLOCKED",
-                    content = "Learn more in the console...",
-                    duration = 5,
-                    icon = CONFIG.DEFAULT_ICON
-                })
-                return newcclosure(function() end)
+            if sfind(norm, word, 1, true) or sfind(compact, word, 1, true) then
+                return blockCode('hard signature "' .. word .. '"')
             end
         end
 
-        for _, word in ipairs(CodeBlacklistSoft) do
-            if sfind(codeStr, word, 1, true) then
-
-                if isForgivenByGameContext(word) then
-
-                else
-                    if getgenv()._verbose_soft_warnings then
-                        warn(("Notice: loadstring from \"%s\" contains suspicious word \"%s\". Code was NOT blocked; this is a warning only.")
-                        :format(source, word))
-                    end
-                    break
-                end
-            end
+        if softTrusted then
+            return origLoadstring(code, chunkname)
         end
 
         for _, sig in ipairs(CodeSignaturePatterns) do
-            local matched = smatch(codeStr, sig.pattern)
-            if matched then
-                if sig.hard then
-                    warn("╔═════════━━━ • ━━━═════════╗")
-                    warn("[ STEALER - BLOCKED ]")
-                    warn("Time : " .. os.date("%H:%M:%S"))
-                    warn("Source script : " .. source)
-                    warn("Reason : pattern signature \"" .. sig.label .. "\"")
-                    warn("╚═════════━━━ • ━━━═════════╝")
-                    NotifyToast({
-                        title = "STEALER - BLOCKED",
-                        content = "Learn more in the console...",
-                        duration = 5,
-                        icon = CONFIG.DEFAULT_ICON
-                    })
-                    return newcclosure(function() end)
-                else
-                    if getgenv()._verbose_soft_warnings then
-                        warn(("Notice: loadstring from \"%s\" contains suspicious pattern \"%s\". Code was NOT blocked; this is a warning only.")
-                            :format(source, sig.label))
-                    end
-                end
+            if sig.hard and smatch(norm, sig.pattern) then
+                return blockCode('pattern signature "' .. sig.label .. '"')
             end
         end
 
-        if sfind(codeStr, "webhook", 1, true) then
-            for _, marker in ipairs(ENV_INJECTION_MARKERS) do
-                if sfind(codeStr, marker, 1, true) then
-                    if getgenv()._verbose_soft_warnings then
+        if getgenv()._verbose_soft_warnings then
+            local source = getCallingScriptName()
+
+            for _, word in ipairs(CodeBlacklistSoft) do
+                if sfind(norm, word, 1, true) and not isForgivenByGameContext(word) then
+                    warn(("Notice: loadstring from \"%s\" contains suspicious word \"%s\". Code was NOT blocked; this is a warning only.")
+                        :format(source, word))
+                    break
+                end
+            end
+
+            for _, sig in ipairs(CodeSignaturePatterns) do
+                if not sig.hard and smatch(norm, sig.pattern) then
+                    warn(("Notice: loadstring from \"%s\" contains suspicious pattern \"%s\". Code was NOT blocked; this is a warning only.")
+                        :format(source, sig.label))
+                end
+            end
+
+            if sfind(norm, "webhook", 1, true) then
+                for _, marker in ipairs(ENV_INJECTION_MARKERS) do
+                    if sfind(norm, marker, 1, true) then
                         warn(("Notice: loadstring from \"%s\" contains a webhook plus marker \"%s\". Code was NOT blocked; this is a warning only.")
                             :format(source, marker))
+                        break
                     end
-                    break
                 end
             end
         end
@@ -1375,88 +1764,117 @@ if getgenv()._scan_loadstring and hookfunction and type(loadstring) == "function
     end))
 end
 
+local localUserId = player and player.UserId
+
+-- Works for the real LocalPlayer and for cloneref'd copies of it.
+local function isLocalPlayer(inst)
+    if inst == player then return true end
+    local ok, res = _pcall(function()
+        return inst.ClassName == "Player" and inst.UserId == localUserId
+    end)
+    return ok and res == true
+end
+
+local WATCHED_METHODS = {
+    HttpGet = true, HttpGetAsync = true, GetAsync = true, GetObjects = true,
+    HttpPost = true, HttpPostAsync = true, PostAsync = true,
+    RequestAsync = true, ReportAbuse = true, Kick = true,
+}
+
 local oldNamecall
 local namecallHookOk, namecallHookErr = pcall(function()
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-    local method = getnamecallmethod()
-    local args = { ... }
-    local url = args[1]
-    local body = args[2]
+        local method = getnamecallmethod()
 
-    if method == "HttpGet" or method == "HttpGetAsync" or method == "GetAsync" then
-        local blocked, tag = isBlocked(url, nil, nil, false)
-        if blocked then
-            logBlock(tag, url)
-            return ""
+        -- hot path: almost every call leaves here without allocating anything
+        if not WATCHED_METHODS[method] then
+            return oldNamecall(self, ...)
         end
-        local result = oldNamecall(self, ...)
-        if type(result) == "string" then
-            return sanitizeBody(result, getHost(urlDecode(url)))
-        end
-        return result
 
-    elseif method == "GetObjects" then
-        if type(url) == "string" and (sfind(url, "http://", 1, true) or sfind(url, "https://", 1, true)) then
+        local url, body = ...
+
+        if method == "Kick" then
+            if getgenv()._anti_kick and isLocalPlayer(self) then
+                logKick()
+                return
+            end
+            return oldNamecall(self, ...)
+
+        elseif method == "ReportAbuse" then
+            if getgenv()._anti_reportabuse and not checkcaller() then
+                logReportAbuse()
+                return
+            end
+            return oldNamecall(self, ...)
+
+        elseif method == "HttpGet" or method == "HttpGetAsync" or method == "GetAsync" then
             local blocked, tag = isBlocked(url, nil, nil, false)
             if blocked then
                 logBlock(tag, url)
-                return {}
+                return ""
             end
-            if getgenv()._verbose_soft_warnings then
-                _warn("GetObjects called with an external URL: " .. _tostring(url))
+            local result = oldNamecall(self, ...)
+            if type(result) == "string" then
+                return sanitizeBody(result, getHost(urlDecode(url)))
             end
+            return result
+
+        elseif method == "GetObjects" then
+            if type(url) == "string" and (sfind(url, "http://", 1, true) or sfind(url, "https://", 1, true)) then
+                local blocked, tag = isBlocked(url, nil, nil, false)
+                if blocked then
+                    logBlock(tag, url)
+                    return {}
+                end
+                if getgenv()._verbose_soft_warnings then
+                    _warn("GetObjects called with an external URL: " .. _tostring(url))
+                end
+            end
+            return oldNamecall(self, ...)
+
+        elseif method == "HttpPost" or method == "HttpPostAsync" or method == "PostAsync" then
+            local blocked, tag = isBlocked(url, body, nil, true)
+            if blocked then
+                logBlock(tag, url)
+                return ""
+            end
+            return oldNamecall(self, ...)
+
+        elseif method == "RequestAsync" and type(url) == "table" then
+            local reqUrl = url.Url or url.url
+            local reqBody = url.Body or url.body
+            local reqHeaders = url.Headers or url.headers
+            local reqMethod = string.upper(tostring(url.Method or "GET"))
+            local isPost = (reqMethod ~= "GET")
+            local blocked, tag = isBlocked(reqUrl, reqBody, reqHeaders, isPost)
+            if blocked then
+                logBlock(tag, reqUrl)
+                return {
+                    Success = false,
+                    StatusCode = 403,
+                    StatusMessage = "Blocked",
+                    Body = "",
+                    Headers = {}
+                }
+            end
+            local result = oldNamecall(self, ...)
+            if type(result) == "table" then
+                local newResult = {}
+                for k, v in pairs(result) do newResult[k] = v end
+                if newResult.Body then newResult.Body = sanitizeBody(newResult.Body, getHost(urlDecode(reqUrl))) end
+                if newResult.body then newResult.body = sanitizeBody(newResult.body, getHost(urlDecode(reqUrl))) end
+                return newResult
+            end
+            return result
         end
+
         return oldNamecall(self, ...)
-
-    elseif method == "HttpPost" or method == "HttpPostAsync" or method == "PostAsync" then
-        local blocked, tag = isBlocked(url, body, nil, true)
-        if blocked then
-            logBlock(tag, url)
-            return ""
-        end
-        return oldNamecall(self, ...)
-
-    elseif method == "RequestAsync" and type(url) == "table" then
-        local reqUrl = url.Url or url.url
-        local reqBody = url.Body or url.body
-        local reqHeaders = url.Headers or url.headers
-        local reqMethod = string.upper(tostring(url.Method or "GET"))
-        local isPost = (reqMethod ~= "GET")
-        local blocked, tag = isBlocked(reqUrl, reqBody, reqHeaders, isPost)
-        if blocked then
-            logBlock(tag, reqUrl)
-            return {
-                Success = false,
-                StatusCode = 403,
-                StatusMessage = "Blocked",
-                Body = "",
-                Headers = {}
-            }
-        end
-        local result = oldNamecall(self, ...)
-        if type(result) == "table" then
-            local newResult = {}
-            for k, v in pairs(result) do newResult[k] = v end
-            if newResult.Body then newResult.Body = sanitizeBody(newResult.Body, getHost(urlDecode(reqUrl))) end
-            if newResult.body then newResult.body = sanitizeBody(newResult.body, getHost(urlDecode(reqUrl))) end
-            return newResult
-        end
-        return result
-
-    elseif method == "ReportAbuse" and getgenv()._anti_reportabuse and not checkcaller() then
-        logReportAbuse()
-        return
-    end
-
-    return oldNamecall(self, ...)
     end))
 end)
 
 if not namecallHookOk then
-    warn("CRITICAL: failed to install the __namecall hook (Section 10). Error: " .. tostring(namecallHookErr))
+    warn("CRITICAL: failed to install the __namecall hook. Error: " .. tostring(namecallHookErr))
 end
-
-local kickHookTarget
 
 local function checkActorEvasionRisk()
     if not getgenv()._warn_actor_risk then return end
@@ -1492,33 +1910,28 @@ task.spawn(function()
     _pcall(checkActorEvasionRisk)
 end)
 
-if getgenv()._anti_kick then
+-- Player.Kick(player) (dot-call) does not go through __namecall.
+-- Hooked with hookfunction; the __namecall hook above covers player:Kick().
+if getgenv()._anti_kick and type(hookfunction) == "function" and player then
     local kickHookOk, kickHookErr = pcall(function()
-        local p = game:GetService("Players").LocalPlayer
-        local o = getrawmetatable(game)
-        local s = o.__namecall
-        local w = newcclosure(function(self, ...)
-            local m = getnamecallmethod()
-            if m == "Kick" and self == p then
+        local origKick
+        origKick = hookfunction(player.Kick, newcclosure(function(self, ...)
+            if getgenv()._anti_kick and isLocalPlayer(self) then
                 logKick()
                 return
             end
-            return s(self, ...)
-        end)
-        setreadonly(o, false)
-        o.__namecall = w
-        setreadonly(o, true)
-        kickHookTarget = w
+            return origKick(self, ...)
+        end))
     end)
 
     if not kickHookOk then
-        warn("Failed to install the anti-kick hook. Error: " .. tostring(kickHookErr))
+        warn("Could not hook Player.Kick for dot-calls (player:Kick() is still blocked). Error: " .. tostring(kickHookErr))
     end
 end
 
 local function wrapExecutorRequest(fn)
     if type(fn) ~= "function" then return fn end
-    return function(opts, ...)
+    return newcclosure(function(opts, ...)
         if type(opts) ~= "table" then return fn(opts, ...) end
         local reqUrl = opts.Url or opts.URL or opts.url
         local reqBody = opts.Body or opts.body
@@ -1540,7 +1953,7 @@ local function wrapExecutorRequest(fn)
             return newResult
         end
         return result
-    end
+    end)
 end
 
 local HookStatus = {}
@@ -1568,6 +1981,7 @@ end
 tryHookGlobal("request", function() return request end, function(w) getgenv().request = w; _G.request = w end)
 tryHookGlobal("http_request", function() return http_request end, function(w) getgenv().http_request = w; _G.http_request = w end)
 tryHookGlobal("syn.request", function() return syn and syn.request end, function(w) syn.request = w end)
+tryHookGlobal("http.request", function() return http and http.request end, function(w) http.request = w end)
 tryHookGlobal("Fluxus.request", function() return Fluxus and Fluxus.request end, function(w) Fluxus.request = w end)
 tryHookGlobal("KRNL_LOADED.request", function() return KRNL_LOADED and KRNL_LOADED.request end, function(w) KRNL_LOADED.request = w end)
 
@@ -1690,7 +2104,7 @@ getgenv().BloxScannerUnload = function()
         "_anti_reportabuse", "_anti_robux_prompt", "_block_bare_ip",
         "_block_relay_hosts", "_strict_webhook", "_game_context_aware",
         "_warn_actor_risk", "_anti_afk",
-        "_verbose_soft_warnings",
+        "_verbose_soft_warnings", "_scan_loadstring", "_strict_identity",
     }
     for _, f in ipairs(flags) do
         getgenv()[f] = false
