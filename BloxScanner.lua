@@ -1,3 +1,11 @@
+-- BloxScanner (improved)
+-- Changes: roproxy GET allowed; hwid-only requests no longer blocked (see _strict_identity);
+-- single __namecall hook with no allocation on the hot path (kick check merged in, cloneref-safe);
+-- Player.Kick dot-call hook; loadstring scanner now decodes "a".."b", \ddd, \xHH, string.char;
+-- loadstring whitelist: plain text only skips soft checks, "sha256:<hex>" skips everything;
+-- IP sanitizer leaves downloaded Lua code untouched; multi-label blacklist entries now match;
+-- duplicate block logs collapsed; request wrappers are newcclosure; http.request hooked.
+
 -- :) i love you, thank you for using script
 
 if getgenv().__BloxScannerLoaded then
@@ -724,270 +732,45 @@ local function downloadImage(url)
     return nil
 end
 
-local ToastConfig = {
-    ["Slide In Time"] = 0.4,
-    ["Slide Out Time"] = 0.05,
-    ["Scale Time"] = 0.11,
-    ["Scale Down"] = 0.96,
-    ["Start Y"] = -1,
-    ["End Y"] = 59,
-    ["Default Duration"] = 2,
-    ["Background Color"] = Color3.fromHex("#23262C"),
-    ["Text Color"] = Color3.fromRGB(247,247,248),
-    ["Width Offset"] = -24,
-    ["Title Size"] = 20,
-    ["Subtitle Size"] = 15,
-    ["Icon Size"] = 36,
-    ["Icon Text Size"] = 26,
-    ["Remove Previous"] = false,
-    ["Corner Radius"] = 6,
-    ["Min Height"] = 60,
-    ["Thumb Size"] = 150
-}
-
-local ThumbTypes = {
-    ["Asset"] = { w = 150, h = 150, type = "Asset" },
-    ["Avatar"] = { w = 150, h = 150, type = "Avatar" },
-    ["Avatar Bust"] = { w = 150, h = 150, type = "AvatarBust" },
-    ["Avatar Head Shot"] = { w = 150, h = 150, type = "AvatarHeadShot" },
-    ["Badge Icon"] = { w = 150, h = 150, type = "BadgeIcon" },
-    ["Bundle Thumbnail"] = { w = 150, h = 150, type = "BundleThumbnail" },
-    ["Font Family"] = { w = 150, h = 150, type = "FontFamily" },
-    ["Game Icon"] = { w = 150, h = 150, type = "GameIcon" },
-    ["Game Pass"] = { w = 150, h = 150, type = "GamePass" },
-    ["Game Thumbnail"] = { w = 256, h = 144, type = "GameThumbnail" },
-    ["Group Icon"] = { w = 150, h = 150, type = "GroupIcon" },
-    ["Outfit"] = { w = 150, h = 150, type = "Outfit" },
-}
-
-local ThumbTypeAliases = {
-    ["Asset"] = "Asset", ["Image"] = "Asset", ["Decal"] = "Asset", ["Audio"] = "Asset",
-    ["Mesh"] = "Asset", ["Model"] = "Asset", ["Animation"] = "Asset", ["Video"] = "Asset",
-    ["Plugin"] = "Asset", ["Tshirt"] = "Asset", ["Shirt"] = "Asset", ["Pants"] = "Asset",
-    ["Hat"] = "Asset", ["Accessory"] = "Asset", ["Face"] = "Asset", ["Head"] = "Asset", ["Gear"] = "Asset",
-    ["Avatar"] = "Avatar", ["User"] = "Avatar", ["Player"] = "Avatar",
-    ["Avatar Bust"] = "Avatar Bust", ["Bust"] = "Avatar Bust",
-    ["Avatar Head Shot"] = "Avatar Head Shot", ["Headshot"] = "Avatar Head Shot",
-    ["Badge"] = "Badge Icon", ["Badge Icon"] = "Badge Icon",
-    ["Bundle"] = "Bundle Thumbnail", ["Bundle Thumbnail"] = "Bundle Thumbnail",
-    ["Font"] = "Font Family", ["Font Family"] = "Font Family",
-    ["Game"] = "Game Icon", ["Game Icon"] = "Game Icon", ["Experience"] = "Game Icon",
-    ["Game Pass"] = "Game Pass", ["Pass"] = "Game Pass",
-    ["Game Thumbnail"] = "Game Thumbnail", ["Place"] = "Game Thumbnail",
-    ["Group"] = "Group Icon", ["Group Icon"] = "Group Icon", ["Outfit"] = "Outfit",
+local CONFIG = {
+    SLIDE_IN_TIME = 0.4,
+    SLIDE_OUT_TIME = 0.05,
+    SCALE_TIME = 0.11,
+    SCALE_DOWN = 0.96,
+    START_Y = -1,
+    END_Y = 59,
+    DEFAULT_DURATION = 2,
+    BACKGROUND_COLOR = Color3.fromHex("#23262C"),
+    TEXT_COLOR = Color3.fromRGB(247, 247, 248),
+    WIDTH_OFFSET = -24,
+    TITLE_SIZE = 20,
+    SUBTITLE_SIZE = 15,
+    ICON_SIZE = 40,
+    ICON_TEXT_SIZE = 26,
+    REMOVE_PREVIOUS = true,
+    CORNER_RADIUS = 6,
+    MIN_HEIGHT = 55,
+    TOAST_HEIGHT_FULL = 77,
+    TOAST_HEIGHT_SMALL = 55,
+    DEFAULT_ICON = getgenv()._icon_asset or "rbxassetid://83768500686029",
 }
 
 local currentToast = nil
-local imageCounter = 0
-
-local function ensureToastFolder(path)
-    pcall(function()
-        if not isfolder(path) then
-            makefolder(path)
-        end
-    end)
-end
-
-local function autoDeleteToastFile(filepath)
-    task.delay(10, function()
-        pcall(function()
-            if isfile(filepath) then
-                delfile(filepath)
-            end
-        end)
-    end)
-end
-
-local function toNumberId(value)
-    if type(value) == "number" then
-        return math.floor(value)
-    end
-    if type(value) ~= "string" then
-        return nil
-    end
-    local n = value:match("(%d+)")
-    return n and tonumber(n) or nil
-end
-
-local function normalizeThumbType(thumbType)
-    if type(thumbType) ~= "string" or thumbType == "" then
-        return nil
-    end
-    if ThumbTypes[thumbType] then
-        return thumbType
-    end
-    local normalized = thumbType:lower():gsub("[%s_%-]", "")
-    for aliasKey, canonical in pairs(ThumbTypeAliases) do
-        if aliasKey:lower():gsub("[%s_%-]", "") == normalized then
-            return canonical
-        end
-    end
-    return nil
-end
-
-local function makeRbxThumb(thumbType, id, size)
-    local info = ThumbTypes[thumbType]
-    if not info or not id then
-        return nil
-    end
-    local rbxType = info.type or thumbType:gsub("%s", "")
-    local w, h = info.w, info.h
-    if type(size) == "number" then
-        w, h = size, size
-    elseif type(size) == "table" then
-        w = size.w or size.x or size[1] or w
-        h = size.h or size.y or size[2] or h
-    end
-    return string.format("rbxthumb://type=%s&id=%d&w=%d&h=%d", rbxType, id, w, h)
-end
-
-local function extractIdFromRobloxUrl(url)
-    local id = url:match("roblox%.com/[^%s]*%a+/(%d+)")
-        or url:match("[?&]id=(%d+)")
-        or url:match("/asset/%?id=(%d+)")
-    return id and tonumber(id) or nil
-end
-
-local function inferThumbTypeFromUrl(url)
-    local lower = url:lower()
-    if lower:match("/users/") or lower:match("/user%.aspx") or lower:match("userid=") then
-        return "Avatar Head Shot"
-    end
-    if lower:match("/groups/") or lower:match("groupid=") then
-        return "Group Icon"
-    end
-    if lower:match("/badges/") or lower:match("badgeid=") then
-        return "Badge Icon"
-    end
-    if lower:match("/game%-pass") or lower:match("/gamepass") or lower:match("gamepass") then
-        return "Game Pass"
-    end
-    if lower:match("/bundles/") then
-        return "Bundle Thumbnail"
-    end
-    if lower:match("/games/") or lower:match("/experiences/") then
-        return "Game Icon"
-    end
-    return "Asset"
-end
-
-local function isContentScheme(value)
-    if type(value) ~= "string" then
-        return false
-    end
-    return value:match("^rbxassetid://")
-        or value:match("^rbxasset://")
-        or value:match("^rbxthumb://")
-        or value:match("^rbxgameasset://")
-        or value:match("^rbxhttp://")
-        or value:match("^rbxalias://")
-end
-
-local function isHttpUrl(value)
-    return type(value) == "string" and value:match("^https?://") ~= nil
-end
-
-local function isRobloxHost(url)
-    local lower = url:lower()
-    return lower:match("roblox%.com") ~= nil or lower:match("rbxcdn%.com") ~= nil
-end
-
-local function resolveIconContent(config)
-    local icon = config.icon
-    local thumbType = normalizeThumbType(config.iconType or config.thumbType or config.assetType or config.AssetType)
-    local thumbSize = config.iconThumbSize or config.thumbSize or ToastConfig["Thumb Size"]
-
-    if type(icon) == "number" then
-        if thumbType then
-            return makeRbxThumb(thumbType, icon, thumbSize)
-        end
-        return "rbxassetid://" .. tostring(icon)
-    end
-
-    if type(icon) ~= "string" then
-        return nil, "text"
-    end
-
-    if isContentScheme(icon) then
-        if thumbType then
-            local id = toNumberId(icon)
-            local built = id and makeRbxThumb(thumbType, id, thumbSize)
-            if built then
-                return built
-            end
-        end
-        return icon
-    end
-
-    if isHttpUrl(icon) then
-        if isRobloxHost(icon) then
-            local id = extractIdFromRobloxUrl(icon)
-            local inferred = thumbType or inferThumbTypeFromUrl(icon)
-            if id then
-                return makeRbxThumb(inferred, id, thumbSize)
-            end
-        end
-        return icon, "url"
-    end
-
-    if icon:match("^%d+$") then
-        local id = tonumber(icon)
-        if thumbType then
-            return makeRbxThumb(thumbType, id, thumbSize)
-        end
-        return "rbxassetid://" .. icon
-    end
-
-    local looseId = icon:match("rbxassetid:?/*(%d+)") or icon:match("asset/?id=(%d+)")
-    if looseId then
-        local id = tonumber(looseId)
-        if thumbType then
-            return makeRbxThumb(thumbType, id, thumbSize)
-        end
-        return "rbxassetid://" .. looseId
-    end
-
-    return icon, "text"
-end
-
-local function createImageIcon(image, iconColor)
-    local iconObj = Instance.new("ImageLabel")
-    iconObj.Name = "ToastIcon"
-    iconObj.Image = image
-    iconObj.ImageColor3 = iconColor or Color3.new(1, 1, 1)
-    iconObj.BackgroundTransparency = 1
-    iconObj.Size = UDim2.new(0, ToastConfig["Icon Size"], 0, ToastConfig["Icon Size"])
-    iconObj.ScaleType = Enum.ScaleType.Fit
-    iconObj.LayoutOrder = 1
-    return iconObj
-end
-
-local function loadUrlIcon(url, iconColor)
-    local req = http_request or (syn and syn.request) or request
-    if not req then
-        return createImageIcon(url, iconColor)
-    end
-
-    local folderPath = "./temp/img"
-    ensureToastFolder(folderPath)
-    imageCounter = imageCounter + 1
-    local filename = folderPath .. "/" .. imageCounter .. ".png"
-    local success, res = pcall(function()
-        return req({ Url = url, Method = "GET" }).Body
-    end)
-    if success and res then
-        writefile(filename, res)
-        autoDeleteToastFile(filename)
-        local asset = getcustomasset(filename)
-        return createImageIcon(asset, iconColor)
-    end
-    return nil
-end
+local _lastToastKey = nil
+local _lastToastTime = 0
 
 local function NotifyToast(config)
     config = config or {}
 
-    if ToastConfig["Remove Previous"] and currentToast and currentToast.Parent then
+    local dedupKey = tostring(config.title) .. "||" .. tostring(config.content or config.subtitle)
+    local now = tick()
+    if dedupKey == _lastToastKey and (now - _lastToastTime) < 1 then
+        return
+    end
+    _lastToastKey = dedupKey
+    _lastToastTime = now
+
+    if CONFIG.REMOVE_PREVIOUS and currentToast and currentToast.Parent then
         currentToast:Destroy()
     end
 
@@ -1005,37 +788,34 @@ local function NotifyToast(config)
     currentToast = screenGui
 
     local container = Instance.new("TextButton")
-    container.Name = "ToastContainer"
     container.AnchorPoint = Vector2.new(0.5, 0.5)
-    container.Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
+    container.Position = UDim2.new(0.5, 0, 0, CONFIG.START_Y)
     container.BackgroundTransparency = 1
     container.Text = ""
     container.Parent = screenGui
 
     local sizeConstraint = Instance.new("UISizeConstraint")
     sizeConstraint.MaxSize = Vector2.new(400, math.huge)
-    sizeConstraint.MinSize = Vector2.new(0, ToastConfig["Min Height"])
     sizeConstraint.Parent = container
 
     local bg = Instance.new("Frame")
-    bg.Name = "Toast"
-    bg.BackgroundColor3 = ToastConfig["Background Color"]
+    bg.BackgroundColor3 = CONFIG.BACKGROUND_COLOR
     bg.BackgroundTransparency = 0
     bg.BorderSizePixel = 0
-    bg.Size = UDim2.new(1,0,1,0)
+    bg.Size = UDim2.new(1, 0, 1, 0)
     bg.Parent = container
 
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, ToastConfig["Corner Radius"])
+    corner.CornerRadius = UDim.new(0, CONFIG.CORNER_RADIUS)
     corner.Parent = bg
 
     local innerFrame = Instance.new("Frame")
     innerFrame.BackgroundTransparency = 1
-    innerFrame.Size = UDim2.new(1,0,1,0)
+    innerFrame.Size = UDim2.new(1, 0, 1, 0)
     innerFrame.Parent = bg
 
     local hList = Instance.new("UIListLayout")
-    hList.Padding = UDim.new(0,12)
+    hList.Padding = UDim.new(0, 12)
     hList.FillDirection = Enum.FillDirection.Horizontal
     hList.SortOrder = Enum.SortOrder.LayoutOrder
     hList.VerticalAlignment = Enum.VerticalAlignment.Center
@@ -1043,19 +823,19 @@ local function NotifyToast(config)
 
     local msgFrame = Instance.new("Frame")
     msgFrame.BackgroundTransparency = 1
-    msgFrame.Size = UDim2.new(1,0,1,0)
+    msgFrame.Size = UDim2.new(1, 0, 1, 0)
     msgFrame.LayoutOrder = 2
     msgFrame.Parent = innerFrame
 
     local vList = Instance.new("UIListLayout")
-    vList.Padding = UDim.new(0,12)
+    vList.Padding = UDim.new(0, 12)
     vList.SortOrder = Enum.SortOrder.LayoutOrder
     vList.VerticalAlignment = Enum.VerticalAlignment.Center
     vList.Parent = msgFrame
 
     local textFrame = Instance.new("Frame")
     textFrame.BackgroundTransparency = 1
-    textFrame.Size = UDim2.new(1,-48,0,0)
+    textFrame.Size = UDim2.new(1, -48, 0, 0)
     textFrame.AutomaticSize = Enum.AutomaticSize.Y
     textFrame.Parent = msgFrame
 
@@ -1065,93 +845,81 @@ local function NotifyToast(config)
     vList2.Parent = textFrame
 
     local title = Instance.new("TextLabel")
-    title.Name = "ToastTitle"
     title.FontFace = Font.new("rbxasset://fonts/families/BuilderSans.json", Enum.FontWeight.Bold)
-    title.TextColor3 = ToastConfig["Text Color"]
-    title.TextSize = ToastConfig["Title Size"]
+    title.TextColor3 = CONFIG.TEXT_COLOR
+    title.TextSize = CONFIG.TITLE_SIZE
     title.TextWrapped = true
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.BackgroundTransparency = 1
-    title.Size = UDim2.new(1,0,0,0)
+    title.Size = UDim2.new(1, 0, 0, 0)
     title.AutomaticSize = Enum.AutomaticSize.Y
     title.RichText = true
     title.LayoutOrder = 1
+    title.Text = config.title or ""
     title.Parent = textFrame
 
     local subtitle = Instance.new("TextLabel")
-    subtitle.Name = "ToastSubtitle"
     subtitle.FontFace = Font.new("rbxasset://fonts/families/BuilderSans.json")
-    subtitle.TextColor3 = ToastConfig["Text Color"]
-    subtitle.TextSize = ToastConfig["Subtitle Size"]
+    subtitle.TextColor3 = CONFIG.TEXT_COLOR
+    subtitle.TextSize = CONFIG.SUBTITLE_SIZE
     subtitle.TextWrapped = true
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
     subtitle.BackgroundTransparency = 1
-    subtitle.Size = UDim2.new(1,0,0,0)
+    subtitle.Size = UDim2.new(1, 0, 0, 0)
     subtitle.AutomaticSize = Enum.AutomaticSize.Y
     subtitle.RichText = true
     subtitle.LayoutOrder = 2
+    subtitle.Text = config.content or config.subtitle or ""
     subtitle.Parent = textFrame
 
     local padding = Instance.new("UIPadding")
-    padding.PaddingLeft = UDim.new(0,12)
-    padding.PaddingRight = UDim.new(0,12)
-    padding.PaddingTop = UDim.new(0,12)
-    padding.PaddingBottom = UDim.new(0,12)
+    padding.PaddingLeft = UDim.new(0, 12)
+    padding.PaddingRight = UDim.new(0, 12)
+    padding.PaddingTop = UDim.new(0, 12)
+    padding.PaddingBottom = UDim.new(0, 12)
     padding.Parent = innerFrame
 
     local scaler = Instance.new("UIScale")
     scaler.Scale = 1
     scaler.Parent = container
 
-    title.Text = config.title or ""
-    subtitle.Text = config.content or config.subtitle or ""
-
-    local duration = config.duration or ToastConfig["Default Duration"]
-    local callback = config.callback or function() end
-
     local showIcon = config.icon and config.icon ~= ""
-    local iconObj = innerFrame:FindFirstChild("ToastIcon")
-    if iconObj then iconObj:Destroy() end
-
-    local iconColor = config.iconColor
-    if type(iconColor) == "string" and iconColor:match("^#") then
-        iconColor = Color3.fromHex(iconColor)
-    end
+    local iconObj
 
     if showIcon then
-        local content, kind = resolveIconContent(config)
+        local isUrl = type(config.icon) == "string" and config.icon:match("^https?://")
+        local isAsset = type(config.icon) == "string" and (config.icon:match("^rbxassetid://") or config.icon:match("^rbxasset://")) or type(config.icon) == "number"
 
-        if kind == "url" then
-            iconObj = loadUrlIcon(content, iconColor)
-        elseif kind == "text" then
+        if isUrl then
+            local asset = downloadImage(config.icon)
+            if asset then
+                iconObj = Instance.new("ImageLabel")
+                iconObj.Image = asset
+                iconObj.BackgroundTransparency = 1
+                iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
+                iconObj.LayoutOrder = 1
+                iconObj.Parent = innerFrame
+            end
+        elseif isAsset then
+            local id = type(config.icon) == "number" and "rbxassetid://" .. config.icon or config.icon
+            iconObj = Instance.new("ImageLabel")
+            iconObj.Image = id
+            iconObj.BackgroundTransparency = 1
+            iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
+            iconObj.LayoutOrder = 1
+            iconObj.Parent = innerFrame
+        else
             iconObj = Instance.new("TextLabel")
-            iconObj.Name = "ToastIcon"
             iconObj.FontFace = Font.new("rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json", Enum.FontWeight.Bold)
-            iconObj.Text = tostring(content or config.icon)
-            iconObj.TextColor3 = iconColor or ToastConfig["Text Color"]
-            iconObj.TextSize = ToastConfig["Icon Text Size"]
+            iconObj.Text = config.icon
+            iconObj.TextColor3 = CONFIG.TEXT_COLOR
+            iconObj.TextSize = CONFIG.ICON_TEXT_SIZE
             iconObj.TextXAlignment = Enum.TextXAlignment.Center
             iconObj.TextYAlignment = Enum.TextYAlignment.Center
             iconObj.BackgroundTransparency = 1
-            iconObj.Size = UDim2.new(0, ToastConfig["Icon Size"], 0, ToastConfig["Icon Size"])
+            iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
             iconObj.LayoutOrder = 1
-        elseif content then
-            iconObj = createImageIcon(content, iconColor)
-        end
-
-        if iconObj then
             iconObj.Parent = innerFrame
-
-            local radius = config.iconCornerRadius or config.iconRadius or config.IconCorner or config.IconRadius or 0
-            if radius ~= 0 then
-                local iconCorner = Instance.new("UICorner")
-                if radius == true or radius == 0.5 or radius >= 18 then
-                    iconCorner.CornerRadius = UDim.new(0.5, 0)
-                else
-                    iconCorner.CornerRadius = UDim.new(0, radius)
-                end
-                iconCorner.Parent = iconObj
-            end
         end
     end
 
@@ -1160,70 +928,60 @@ local function NotifyToast(config)
 
     local hasTitle = title.Text ~= ""
     local hasSubtitle = subtitle.Text ~= ""
-    title.Visible = hasTitle
-    subtitle.Visible = hasSubtitle
+    local toastHeight = (hasTitle and hasSubtitle) and CONFIG.TOAST_HEIGHT_FULL or CONFIG.TOAST_HEIGHT_SMALL
+    toastHeight = math.max(toastHeight, CONFIG.MIN_HEIGHT)
 
-    container.Size = UDim2.new(1, ToastConfig["Width Offset"], 0, 0)
-    container.AutomaticSize = Enum.AutomaticSize.Y
-    bg.AutomaticSize = Enum.AutomaticSize.Y
-    innerFrame.AutomaticSize = Enum.AutomaticSize.Y
-    msgFrame.AutomaticSize = Enum.AutomaticSize.Y
+    container.Size = UDim2.new(1, CONFIG.WIDTH_OFFSET, 0, toastHeight)
+    bg.Size = UDim2.new(1, 0, 1, 0)
+    innerFrame.Size = UDim2.new(1, 0, 1, 0)
+    msgFrame.Size = UDim2.new(1, 0, 1, 0)
 
-    screenGui.Enabled = true
-    container.Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
-    scaler.Scale = 1
+    local minHeightConstraint = Instance.new("UISizeConstraint")
+    minHeightConstraint.MinSize = Vector2.new(0, CONFIG.MIN_HEIGHT)
+    minHeightConstraint.Parent = container
 
     task.wait()
 
     local actualHeight = container.AbsoluteSize.Y
-    local dynamicShowY = ToastConfig["End Y"]/2.818 + (actualHeight / 2)
+    local dynamicShowY = CONFIG.END_Y / 2.818 + (actualHeight / 2)
 
-    container.Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
+    container.Position = UDim2.new(0.5, 0, 0, CONFIG.START_Y)
 
-    TweenService:Create(container, TweenInfo.new(ToastConfig["Slide In Time"], Enum.EasingStyle.Quint), {
-        Position = UDim2.new(0.5,0,0,dynamicShowY)
+    TweenService:Create(container, TweenInfo.new(CONFIG.SLIDE_IN_TIME, Enum.EasingStyle.Quint), {
+        Position = UDim2.new(0.5, 0, 0, dynamicShowY)
     }):Play()
 
     local function hideToast()
-        TweenService:Create(container, TweenInfo.new(ToastConfig["Slide Out Time"], Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
-            Position = UDim2.new(0.5,0,0,ToastConfig["Start Y"])
+        TweenService:Create(container, TweenInfo.new(CONFIG.SLIDE_OUT_TIME, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
+            Position = UDim2.new(0.5, 0, 0, CONFIG.START_Y)
         }):Play()
-        task.delay(ToastConfig["Slide Out Time"], function()
+        task.delay(CONFIG.SLIDE_OUT_TIME, function()
             if currentToast == screenGui then currentToast = nil end
             screenGui:Destroy()
         end)
     end
 
-    task.delay(duration, function()
-        if screenGui and screenGui.Parent then
-            hideToast()
-        end
+    task.delay(config.duration or CONFIG.DEFAULT_DURATION, function()
+        if screenGui and screenGui.Parent then hideToast() end
     end)
 
     container.MouseButton1Down:Connect(function()
-        TweenService:Create(scaler, TweenInfo.new(ToastConfig["Scale Time"]), {Scale = ToastConfig["Scale Down"]}):Play()
+        TweenService:Create(scaler, TweenInfo.new(CONFIG.SCALE_TIME), { Scale = CONFIG.SCALE_DOWN }):Play()
     end)
 
     container.MouseButton1Up:Connect(function()
-        TweenService:Create(scaler, TweenInfo.new(ToastConfig["Scale Time"]), {Scale = 1}):Play()
+        TweenService:Create(scaler, TweenInfo.new(CONFIG.SCALE_TIME), { Scale = 1 }):Play()
     end)
 
     container.MouseButton1Click:Connect(function()
         hideToast()
-        callback()
+        if config.callback then config.callback() end
     end)
 
     container.MouseLeave:Connect(function()
-        TweenService:Create(scaler, TweenInfo.new(ToastConfig["Scale Time"]), {Scale = 1}):Play()
+        TweenService:Create(scaler, TweenInfo.new(CONFIG.SCALE_TIME), { Scale = 1 }):Play()
     end)
 end
-
--- Не перезаписываем уже существующий getgenv().NotifyToast.
--- BloxScanner использует локальную NotifyToast, а глобальная функция сохраняется.
-if getgenv().NotifyToast == nil then
-    getgenv().NotifyToast = NotifyToast
-end
-
 
 local lastLog, lastLogN = {}, 0
 
