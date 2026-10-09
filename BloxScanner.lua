@@ -1,10 +1,4 @@
--- BloxScanner (improved)
--- Changes: roproxy GET allowed; hwid-only requests no longer blocked (see _strict_identity);
--- single __namecall hook with no allocation on the hot path (kick check merged in, cloneref-safe);
--- Player.Kick dot-call hook; loadstring scanner now decodes "a".."b", \ddd, \xHH, string.char;
--- loadstring whitelist: plain text only skips soft checks, "sha256:<hex>" skips everything;
--- IP sanitizer leaves downloaded Lua code untouched; multi-label blacklist entries now match;
--- duplicate block logs collapsed; request wrappers are newcclosure; http.request hooked.
+
 
 -- :) i love you, thank you for using script
 
@@ -27,8 +21,8 @@ setDefault("_anti_kick",             true)
 setDefault("_scan_loadstring",       true)
 setDefault("_verbose_soft_warnings", false)
 
-setDefault("_anti_reportabuse",      true)
-setDefault("_anti_robux_prompt",     true)
+setDefault("_anti_reportabuse",      false)
+setDefault("_anti_robux_prompt",     false)
 
 setDefault("_block_bare_ip",         true)
 setDefault("_block_relay_hosts",     true)
@@ -42,6 +36,19 @@ setDefault("_anti_afk",              true)
 -- true  = a single device-identifying field (hwid, machineid...) sent to a relay/tunnel host is blocked.
 -- false = needs 2+ such fields (key/licence systems send just hwid, so they are allowed with a notice).
 setDefault("_strict_identity",       false)
+
+-- v3 options
+setDefault("_protect_real_ip",       true)   -- block requests that contain YOUR real IP
+setDefault("_fake_real_ip",          false)  -- true = swap your real IP for a decoy instead of blocking (request()/RequestAsync only)
+setDefault("_scan_cookie_encodings", true)   -- cookie leaks hidden as hex / base64 / reversed / multi-encoded
+setDefault("_block_discord_tokens",  true)
+setDefault("_block_jwt",             false)  -- JWT is also used by normal APIs, so off by default
+setDefault("_learn_from_responses",  true)   -- block hosts whose response looks like an IP-logger page
+setDefault("_c2_scoring",            true)   -- score punycode / tunnel / DGA-looking hosts
+setDefault("_protect_filesystem",    true)   -- cookie writes to disk + mass-deletion lockdown
+setDefault("_watch_hooks",           true)   -- warn if another script removes our request hooks
+setDefault("_guard_restore",         false)  -- hook restorefunction so our hooks cannot be undone (test on your executor first)
+setDefault("_restore_prehooked",     false)  -- restorefunction() on request/http_request that were hooked before us
 
 setDefault("_icon_asset", "rbxassetid://83768500686029")
 
@@ -81,6 +88,42 @@ local _ipairs  = safeClone(ipairs)
 local _type    = safeClone(type)
 local _tostring = safeClone(tostring)
 local _warn    = safeClone(warn)
+
+-- original request function, captured before we wrap anything (used for the one-time own-IP lookup)
+local rawRequest = safeClone(
+    (type(request) == "function" and request)
+    or (type(http_request) == "function" and http_request)
+    or (type(syn) == "table" and syn.request)
+    or (type(http) == "table" and http.request)
+    or (type(fluxus) == "table" and fluxus.request)
+    or nil
+)
+
+-- Was something hooked before BloxScanner? (only reported in verbose mode: some executors hook internally)
+pcall(function()
+    local isHooked = (type(isfunctionhooked) == "function" and isfunctionhooked)
+                  or (type(ishookedfunction) == "function" and ishookedfunction)
+    if not isHooked then return end
+    local list = {
+        { "request", request }, { "http_request", http_request },
+        { "hookfunction", hookfunction }, { "hookmetamethod", hookmetamethod },
+        { "loadstring", loadstring }, { "restorefunction", restorefunction },
+    }
+    for _, it in ipairs(list) do
+        if type(it[2]) == "function" then
+            local ok, hooked = pcall(isHooked, it[2])
+            if ok and hooked then
+                if getgenv()._verbose_soft_warnings then
+                    warn(("Notice: %s was already hooked before BloxScanner loaded. Another script ran first - load BloxScanner from autoexec."):format(it[1]))
+                end
+                if getgenv()._restore_prehooked and type(restorefunction) == "function"
+                   and (it[1] == "request" or it[1] == "http_request") then
+                    pcall(restorefunction, it[2])
+                end
+            end
+        end
+    end
+end)
 
 local COOKIE_SIG = "warning:-do-not-share-this."
 
@@ -450,6 +493,100 @@ local EXACT_DOMAIN_SET = {
     ["ġooģle.com"] = true,
 }
 
+-- extra logger / IP-lookup / lookalike domains
+for _, d in ipairs({
+    "checkip.amazonaws.com",
+    "checkip.dyndns.org",
+    "checkip.synology.com",
+    "checkip.dns.he.net",
+    "myexternalip.com",
+    "ip.sb",
+    "api.my-ip.io",
+    "my-ip.io",
+    "whatismyip.com",
+    "whatsmyip.net",
+    "extreme-ip-check.com",
+    "getmyip.co",
+    "getmyip.org",
+    "ip-whois.io",
+    "ipwhois.app",
+    "whatismyip.akamai.com",
+    "api.myip.com",
+    "myip.com",
+    "myip.dnsomatic.com",
+    "tnx.nl",
+    "ip.nux.ro",
+    "curlmyip.com",
+    "ipecho.net",
+    "freegeoip.app",
+    "showmyip.com",
+    "cmyip.com",
+    "ip4.me",
+    "l2.io",
+    "ip.anysrc.net",
+    "ip.chinaz.com",
+    "ip.cn",
+    "ip.tool.la",
+    "ip.taobao.com",
+    "geoiptool.com",
+    "myip.opendns.com",
+    "check-my-ip.net",
+    "checkmyip.com",
+    "seeip.org",
+    "api.seeip.org",
+    "ipv4.seeip.org",
+    "ipv6.seeip.org",
+    "eth0.me",
+    "api.bigdatacloud.net",
+    "ipfind.io",
+    "ip2location-io.com",
+    "api.ip2location-io.com",
+    "ip.tyk.nu",
+    "ip.me",
+    "ip.pe.kr",
+    "fortnite.club",
+    "gamertag.shop",
+    "locations.quest",
+    "partpicker.shop",
+    "shhh.lol",
+    "sportshub.bar",
+    "location.cyou",
+    "mymap.icu",
+    "mymap.quest",
+    "mapss.icu",
+    "map-s.online",
+    "crypto-o.click",
+    "cryp-o.online",
+    "customer.autos",
+    "account.beauty",
+    "photospace.life",
+    "mymassive.pics",
+    "photovault.store",
+    "imagehub.fun",
+    "picturestash.mom",
+    "clickthis.photo",
+    "sharevault.cloud",
+    "picshare.mom",
+    "picshare.hair",
+    "imagestash.pics",
+    "xtube.chat",
+    "myprivate.yachts",
+    "screensnaps.top",
+    "customersupport.click",
+    "mypicparade.pics",
+    "iptrackeronline.com",
+    "tracemyip.com",
+    "tracemyip.org",
+    "screenshot.click",
+    "shorter.me",
+    "grabb.site",
+    "grabifyicu.com",
+    "iplist.ru",
+    "cob.soy",
+}) do
+    EXACT_DOMAIN_SET[d] = true
+end
+
 local function isExactBlacklisted(host)
     if not host or host == "" then return false end
     if EXACT_DOMAIN_SET[host] then return true end
@@ -638,6 +775,282 @@ local ENV_INJECTION_MARKERS = {
 
 local isBlocked
 local lastWebhookReason = nil
+
+local Stats = { requests = 0, blocked = 0 }
+getgenv().BloxScannerStats = Stats
+
+-- ======================= cookie leak detection (encoded forms) ================
+local COOKIE_PREFIX = "_|WARNING:-DO-NOT-SHARE-THIS"
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function b64encode(s)
+    local out, n = {}, #s
+    for i = 1, n, 3 do
+        local a, b, c = s:byte(i, i + 2)
+        local v = a * 65536 + (b or 0) * 256 + (c or 0)
+        local c1 = math.floor(v / 262144) % 64
+        local c2 = math.floor(v / 4096) % 64
+        local c3 = math.floor(v / 64) % 64
+        local c4 = v % 64
+        out[#out + 1] = B64:sub(c1 + 1, c1 + 1) .. B64:sub(c2 + 1, c2 + 1)
+            .. (b and B64:sub(c3 + 1, c3 + 1) or "=") .. (c and B64:sub(c4 + 1, c4 + 1) or "=")
+    end
+    return table.concat(out)
+end
+
+-- needles that appear inside ANY base64 text containing the cookie, for the 3 possible alignments
+local COOKIE_NEEDLES = {}
+do
+    local dropStart = { [0] = 0, [1] = 2, [2] = 3 }
+    for pad = 0, 2 do
+        local enc = b64encode(("A"):rep(pad) .. COOKIE_PREFIX)
+        enc = enc:gsub("=+$", "")
+        local needle = enc:sub(dropStart[pad] + 1, #enc - 2)
+        if #needle >= 12 then COOKIE_NEEDLES[#COOKIE_NEEDLES + 1] = needle end
+    end
+end
+
+local COOKIE_HEX = (COOKIE_PREFIX:gsub(".", function(c) return ("%02x"):format(c:byte()) end)):lower()
+local MAX_SCAN_LEN = 400000
+
+local function fullUrlDecode(s)
+    local cur = s
+    for _ = 1, 4 do
+        local nxt = urlDecode(cur)
+        if nxt == cur then break end
+        cur = nxt
+    end
+    return cur
+end
+
+-- returns a short label of the encoding found, or nil
+local function cookieEncodedLeak(str)
+    if type(str) ~= "string" or #str < 20 or #str > MAX_SCAN_LEN then return nil end
+    local lowered = slower(str)
+    if sfind(lowered, COOKIE_SIG, 1, true) then return "plain" end
+
+    local decoded = fullUrlDecode(str)
+    if decoded ~= str and sfind(slower(decoded), COOKIE_SIG, 1, true) then return "url-encoded" end
+
+    if sfind(lowered, COOKIE_HEX, 1, true) then return "hex" end
+    for _, needle in ipairs(COOKIE_NEEDLES) do
+        if sfind(str, needle, 1, true) then return "base64" end
+    end
+    if sfind(slower(str:reverse()), COOKIE_SIG, 1, true) then return "reversed" end
+    return nil
+end
+
+-- ======================= token detection (linear, no pattern backtracking) =====
+local function tokenLeak(str)
+    if type(str) ~= "string" or #str < 30 or #str > MAX_SCAN_LEN then return nil end
+    local wantDiscord = getgenv()._block_discord_tokens
+    local wantJwt = getgenv()._block_jwt
+    if not (wantDiscord or wantJwt) then return nil end
+    local checked = 0
+    for tok in str:gmatch("[%w_%-%.]+") do
+        local len = #tok
+        if len >= 30 and len <= 140 then
+            checked = checked + 1
+            if checked > 400 then break end
+            if wantJwt and tok:sub(1, 3) == "eyJ" then
+                local a, b, c = smatch(tok, "^([%w_%-]+)%.([%w_%-]+)%.([%w_%-]+)$")
+                if a then return "JWT/OAuth token" end
+            end
+            if wantDiscord then
+                local u, t, h = smatch(tok, "^([%w_%-]+)%.([%w_%-]+)%.([%w_%-]+)$")
+                if u and #u >= 20 and #u <= 30 and #t >= 5 and #t <= 8 and #h >= 25 and #h <= 40 then
+                    return "Discord token"
+                end
+                if tok:sub(1, 4) == "mfa." and len >= 24 then return "Discord MFA token" end
+            end
+        end
+    end
+    return nil
+end
+
+local function headersToString(headers)
+    if type(headers) ~= "table" then return nil end
+    local parts, n = {}, 0
+    for k, v in pairs(headers) do
+        n = n + 1
+        if n > 60 then break end
+        parts[#parts + 1] = tostring(k) .. ": " .. tostring(v)
+    end
+    return table.concat(parts, "\n")
+end
+
+-- ======================= your real IP =========================================
+local UserIP = nil
+
+local function fetchUserIP()
+    if type(rawRequest) ~= "function" then return end
+    for _, u in ipairs({ "https://api.ipify.org", "https://icanhazip.com", "https://checkip.amazonaws.com" }) do
+        local ok, res = pcall(rawRequest, { Url = u, Method = "GET" })
+        if ok and type(res) == "table" and type(res.Body) == "string" then
+            local cand = res.Body:gsub("%s+", "")
+            if smatch(cand, "^%d+%.%d+%.%d+%.%d+$") or (smatch(cand, "^[%x:]+$") and select(2, cand:gsub(":", "")) >= 2) then
+                UserIP = cand
+                return
+            end
+        end
+    end
+end
+
+if getgenv()._protect_real_ip and rawRequest then
+    task.spawn(function() pcall(fetchUserIP) end)
+end
+
+local function ipBoundaryOk(str, s, e)
+    local before = str:sub(s - 1, s - 1)
+    local after = str:sub(e + 1, e + 1)
+    if before ~= "" and smatch(before, "[%w%.:]") then return false end
+    if after ~= "" and smatch(after, "[%w:]") then return false end
+    if after == "." and smatch(str:sub(e + 2, e + 2), "%d") then return false end
+    return true
+end
+
+local function containsUserIP(str)
+    if not UserIP or type(str) ~= "string" or str == "" or #str > MAX_SCAN_LEN then return false end
+    local pos = 1
+    while true do
+        local s, e = sfind(str, UserIP, pos, true)
+        if not s then return false end
+        if ipBoundaryOk(str, s, e) then return true end
+        pos = e + 1
+    end
+end
+
+local decoyIP
+local function swapUserIP(str)
+    if not UserIP or type(str) ~= "string" or str == "" or #str > MAX_SCAN_LEN then return str, false end
+    decoyIP = decoyIP or ((rnd() < 0.5) and fakeIPv4() or fakeIPv6())
+    local out, pos, changed = {}, 1, false
+    while true do
+        local s, e = sfind(str, UserIP, pos, true)
+        if not s then out[#out + 1] = str:sub(pos); break end
+        if ipBoundaryOk(str, s, e) then
+            out[#out + 1] = str:sub(pos, s - 1)
+            out[#out + 1] = decoyIP
+            changed = true
+        else
+            out[#out + 1] = str:sub(pos, e)
+        end
+        pos = e + 1
+    end
+    return table.concat(out), changed
+end
+
+-- copy of a request options table with url/body/headers replaced (keeps the caller's field names)
+local function copyOptsWith(opts, nu, nb, nh)
+    local c = {}
+    for k, v in pairs(opts) do c[k] = v end
+    if nu ~= nil then
+        if c.Url ~= nil then c.Url = nu elseif c.URL ~= nil then c.URL = nu else c.url = nu end
+    end
+    if nb ~= nil then
+        if c.Body ~= nil then c.Body = nb else c.body = nb end
+    end
+    if nh ~= nil then
+        if c.Headers ~= nil then c.Headers = nh else c.headers = nh end
+    end
+    return c
+end
+
+-- returns newUrl, newBody, newHeaders, changed
+local function swapRealIP(reqUrl, reqBody, reqHeaders)
+    local changed = false
+    local nu, nb, nh = reqUrl, reqBody, reqHeaders
+    if type(reqUrl) == "string" then
+        local r, ch = swapUserIP(reqUrl); if ch then nu, changed = r, true end
+    end
+    if type(reqBody) == "string" then
+        local r, ch = swapUserIP(reqBody); if ch then nb, changed = r, true end
+    end
+    if type(reqHeaders) == "table" then
+        local copy, hch = {}, false
+        for k, v in pairs(reqHeaders) do
+            if type(v) == "string" then
+                local r, ch = swapUserIP(v)
+                copy[k] = r
+                if ch then hch = true end
+            else
+                copy[k] = v
+            end
+        end
+        if hch then nh, changed = copy, true end
+    end
+    return nu, nb, nh, changed
+end
+
+local function wantFakeIP()
+    return getgenv()._protect_real_ip and getgenv()._fake_real_ip and UserIP ~= nil
+end
+
+-- ======================= C2 / suspicious infrastructure scoring ================
+local function shannonEntropy(s)
+    if #s == 0 then return 0 end
+    local freq, len = {}, #s
+    for i = 1, len do
+        local b = s:byte(i)
+        freq[b] = (freq[b] or 0) + 1
+    end
+    local e = 0
+    for _, c in pairs(freq) do
+        local p = c / len
+        e = e - p * math.log(p, 2)
+    end
+    return e
+end
+
+local function hostInSuffixList(host, list)
+    for _, suffix in ipairs(list) do
+        if host == suffix or host:sub(-(#suffix + 1)) == "." .. suffix then return true end
+    end
+    return false
+end
+
+local function hasNonStandardPort(url)
+    local authority = smatch(url, "^%w[%w%+%.%-]*://([^/?#]+)")
+    if not authority or authority:find("%[", 1) then return false end
+    local port = tonumber(smatch(authority, ":(%d+)$"))
+    return port ~= nil and port ~= 80 and port ~= 443
+end
+
+local function scoreC2(url, host, body, isPost)
+    local score, why = 0, {}
+    if sfind(host, "xn--", 1, true) then
+        score = score + 2; why[#why + 1] = "punycode/lookalike domain"
+    end
+    local tunnel = hostInSuffixList(host, RelayHostSuffixes)
+    if tunnel then
+        score = score + 1; why[#why + 1] = "tunnel / free-hosting platform"
+        if hasNonStandardPort(url) then score = score + 2; why[#why + 1] = "non-standard port" end
+    end
+    local label = smatch(host, "^([^%.]+)")
+    if label and #label >= 20 and shannonEntropy(label) > 4.3 then
+        score = score + 1; why[#why + 1] = "random-looking host name"
+    end
+    if isPost and type(body) == "string" and #body > 200 and #body < 200000 then
+        if shannonEntropy(body:sub(1, 4096)) > 7.2 then
+            score = score + 1; why[#why + 1] = "encrypted/random payload"
+        end
+    end
+    return score, table.concat(why, ", ")
+end
+
+-- ======================= per-host upload volume (notice only) ==================
+local HostBytes = {}
+local function trackUpload(host, body)
+    if type(body) ~= "string" or #body == 0 then return end
+    local total = (HostBytes[host] or 0) + #body
+    HostBytes[host] = total
+    if total > 262144 then
+        noticeOnce("vol:" .. host, ("Notice: more than 256 KB uploaded to %s this session (not blocked)."):format(host))
+    end
+end
+
+-- hosts learned from responses (IP-logger pages, geolocation JSON)
+local RuntimeBlocked = {}
 
 local GameContextWords = {}
 
@@ -984,8 +1397,18 @@ local function NotifyToast(config)
 end
 
 local lastLog, lastLogN = {}, 0
+local BlockHistory = {}
+getgenv().BloxScannerPrintLog = function()
+    if #BlockHistory == 0 then warn("BloxScanner: nothing blocked yet.") return end
+    for i, e in ipairs(BlockHistory) do
+        warn(("[%d] %s | %s | %s"):format(i, e.time, e.tag, e.url))
+    end
+end
 
 local function logBlock(tag, url)
+    Stats.blocked = Stats.blocked + 1
+    BlockHistory[#BlockHistory + 1] = { time = os.date("%H:%M:%S"), tag = tostring(tag), url = tostring(url):sub(1, 200) }
+    if #BlockHistory > 100 then table.remove(BlockHistory, 1) end
     if not getgenv()._log_blocks then return end
 
     -- the same block repeated within 3 seconds is shown only once
@@ -1132,6 +1555,15 @@ isBlocked = function(url, body, headers, isPost)
     local ul = slower(dUrl)
     local pl = slower(path)
     local bl = slower(type(body) == "string" and urlDecode(body) or "")
+    Stats.requests = Stats.requests + 1
+
+    if getgenv()._scan_cookie_encodings and not (host == "roblox.com" or host:sub(-11) == ".roblox.com") then
+        local kind = cookieEncodedLeak(url) or cookieEncodedLeak(body) or cookieEncodedLeak(headersToString(headers))
+        if kind then
+            lastWebhookReason = "Roblox cookie in the request (" .. kind .. ")"
+            return true, "STEALER"
+        end
+    end
 
     local COOKIE_SIG_WORD_2 = "roblosecur" .. "ity"
     if sfind(ul, COOKIE_SIG, 1, true) or sfind(ul, COOKIE_SIG_WORD_2, 1, true) or
@@ -1160,6 +1592,26 @@ isBlocked = function(url, body, headers, isPost)
 
     if KnownExfilHosts[host] then
         return true, "STEALER"
+    end
+
+    if RuntimeBlocked[host] then
+        lastWebhookReason = "this host returned an IP-logger style response earlier in this session"
+        return true, "LOGGER"
+    end
+
+    if getgenv()._block_discord_tokens or getgenv()._block_jwt then
+        local what = tokenLeak(url) or tokenLeak(body) or tokenLeak(headersToString(headers))
+        if what then
+            lastWebhookReason = what .. " found in the outgoing request"
+            return true, "STEALER"
+        end
+    end
+
+    if getgenv()._protect_real_ip and UserIP and not wantFakeIP() then
+        if containsUserIP(url) or containsUserIP(body) or containsUserIP(headersToString(headers)) then
+            lastWebhookReason = "your real IP address is inside the outgoing request"
+            return true, "LOGGER"
+        end
     end
 
     if getgenv()._block_bare_ip then
@@ -1218,6 +1670,17 @@ isBlocked = function(url, body, headers, isPost)
             end
         end
     end
+
+    if getgenv()._c2_scoring then
+        local score, why = scoreC2(dUrl, host, body, isPost)
+        if score >= 4 then
+            lastWebhookReason = "possible C2 / exfiltration infrastructure: " .. why
+            return true, "RELAY"
+        elseif score >= 3 then
+            noticeOnce("c2:" .. host, ("Notice: %s looks unusual (%s). Allowed - score %d/4."):format(host, why, score))
+        end
+    end
+    if isPost then trackUpload(host, body) end
 
     if getgenv()._blockwebhook and isPost then
         for _, pat in ipairs(WebhookPatterns) do
@@ -1380,6 +1843,75 @@ local function sanitizeBody(bodyStr, host)
     end
 
     return out
+end
+
+-- ======================= response inspection (learn IP-logger hosts) ==========
+local CODE_HOSTS = {
+    "githubusercontent.com", "github.com", "gitlab.com", "pastebin.com", "paste.ee",
+    "bitbucket.org", "rentry.co", "hastebin.com", "gist.github.com",
+}
+local GIVEAWAYS = {
+    "ip logger", "iplogger", "grabify", "ip grabber", "grab your ip", "track your ip",
+    "logs your ip address", "captures your ip", "ip tracking service",
+}
+local LOC_SOFT = {
+    country = 1, region = 1, city = 1, zip = 1, postal = 1, lat = 1, latitude = 1, lon = 1,
+    longitude = 1, timezone = 1, country_code = 1, region_code = 1, continent = 1,
+    continent_code = 1, currency = 1, calling_code = 1, area_code = 1, metro_code = 1, organization = 1,
+}
+local LOC_HARD = {
+    isp = 1, org = 1, asn = 1, ip = 1, ipaddress = 1, ip_address = 1, query = 1,
+    origin = 1, ipv4 = 1, ipv6 = 1, publicip = 1, public_ip = 1,
+}
+
+local function locationSchemaHits(decoded)
+    local soft, hard = 0, 0
+    local function walk(t, depth)
+        if depth > 4 then return end
+        for k, v in pairs(t) do
+            if type(k) == "string" then
+                local lk = slower(k)
+                if LOC_HARD[lk] then hard = hard + 1; soft = soft + 1
+                elseif LOC_SOFT[lk] then soft = soft + 1 end
+            end
+            if type(v) == "table" then walk(v, depth + 1) end
+        end
+    end
+    pcall(walk, decoded, 0)
+    return soft, hard
+end
+
+-- returns a reason string when the response looks like an IP-logger / geolocation page
+local function inspectResponse(host, body)
+    if not getgenv()._learn_from_responses then return nil end
+    if type(body) ~= "string" or body == "" or host == "" then return nil end
+    if isWhitelisted(host) or RuntimeBlocked[host] then return nil end
+    if hostInSuffixList(host, CODE_HOSTS) then return nil end
+    if #body > 60000 or looksLikeLuaCode(body) then return nil end
+
+    -- logger landing pages are tiny; long API/list responses may just mention these words
+    if #body <= 3000 then
+        local lowered = slower(body)
+        for _, phrase in ipairs(GIVEAWAYS) do
+            if sfind(lowered, phrase, 1, true) then
+                RuntimeBlocked[host] = true
+                return 'response contains "' .. phrase .. '"'
+            end
+        end
+    end
+
+    local first = body:sub(1, 1)
+    if first == "{" or first == "[" then
+        local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+        if ok and type(decoded) == "table" then
+            local soft, hard = locationSchemaHits(decoded)
+            if soft >= 5 and hard >= 1 then
+                RuntimeBlocked[host] = true
+                return ("response is a geolocation record (%d location fields)"):format(soft)
+            end
+        end
+    end
+    return nil
 end
 
 -- Lower-cases the code and undoes cheap obfuscation tricks that hide
@@ -1573,7 +2105,14 @@ local namecallHookOk, namecallHookErr = pcall(function()
             end
             local result = oldNamecall(self, ...)
             if type(result) == "string" then
-                return sanitizeBody(result, getHost(urlDecode(url)))
+                local respHost = getHost(urlDecode(url))
+                local why = inspectResponse(respHost, result)
+                if why then
+                    lastWebhookReason = why
+                    logBlock("LOGGER", url)
+                    return ""
+                end
+                return sanitizeBody(result, respHost)
             end
             return result
 
@@ -1604,6 +2143,16 @@ local namecallHookOk, namecallHookErr = pcall(function()
             local reqHeaders = url.Headers or url.headers
             local reqMethod = string.upper(tostring(url.Method or "GET"))
             local isPost = (reqMethod ~= "GET")
+
+            local swappedOpts = nil
+            if wantFakeIP() then
+                local nu, nb, nh, changed = swapRealIP(reqUrl, reqBody, reqHeaders)
+                if changed then
+                    swappedOpts = copyOptsWith(url, nu, nb, nh)
+                    reqUrl, reqBody, reqHeaders = nu, nb, nh
+                end
+            end
+
             local blocked, tag = isBlocked(reqUrl, reqBody, reqHeaders, isPost)
             if blocked then
                 logBlock(tag, reqUrl)
@@ -1615,8 +2164,20 @@ local namecallHookOk, namecallHookErr = pcall(function()
                     Headers = {}
                 }
             end
-            local result = oldNamecall(self, ...)
+            local result
+            if swappedOpts then
+                result = oldNamecall(self, swappedOpts)
+            else
+                result = oldNamecall(self, ...)
+            end
             if type(result) == "table" then
+                local respBody = result.Body or result.body
+                local why = inspectResponse(getHost(urlDecode(reqUrl)), respBody)
+                if why then
+                    lastWebhookReason = why
+                    logBlock("LOGGER", reqUrl)
+                    return { Success = false, StatusCode = 403, StatusMessage = "Blocked", Body = "", Headers = {} }
+                end
                 local newResult = {}
                 for k, v in pairs(result) do newResult[k] = v end
                 if newResult.Body then newResult.Body = sanitizeBody(newResult.Body, getHost(urlDecode(reqUrl))) end
@@ -1696,6 +2257,15 @@ local function wrapExecutorRequest(fn)
         local reqHeaders = opts.Headers or opts.headers
         local reqMethod = string.upper(tostring(opts.Method or opts.method or "GET"))
         local isPost = (reqMethod ~= "GET")
+
+        if wantFakeIP() then
+            local nu, nb, nh, changed = swapRealIP(reqUrl, reqBody, reqHeaders)
+            if changed then
+                opts = copyOptsWith(opts, nu, nb, nh)
+                reqUrl, reqBody, reqHeaders = nu, nb, nh
+            end
+        end
+
         local blocked, tag = isBlocked(reqUrl, reqBody, reqHeaders, isPost)
         if blocked then
             logBlock(tag, reqUrl)
@@ -1703,6 +2273,12 @@ local function wrapExecutorRequest(fn)
         end
         local result = fn(opts, ...)
         if type(result) == "table" then
+            local why = inspectResponse(getHost(urlDecode(reqUrl)), result.Body or result.body)
+            if why then
+                lastWebhookReason = why
+                logBlock("LOGGER", reqUrl)
+                return { Success = false, StatusCode = 403, StatusMessage = "Blocked", Body = "", Headers = {} }
+            end
             local newResult = {}
             for k, v in pairs(result) do newResult[k] = v end
             local respHost = getHost(urlDecode(reqUrl))
@@ -1715,6 +2291,7 @@ local function wrapExecutorRequest(fn)
 end
 
 local HookStatus = {}
+local HookWatch = {}
 
 local function tryHookGlobal(name, getter, setter)
     local ok, fn = pcall(getter)
@@ -1731,6 +2308,7 @@ local function tryHookGlobal(name, getter, setter)
     local verifyOk, current = pcall(getter)
     if verifyOk and current == wrapped then
         HookStatus[name] = "ok"
+        HookWatch[#HookWatch + 1] = { name = name, getter = getter, wrapped = wrapped, warned = false }
     else
         HookStatus[name] = "не применилось (возможно readonly)"
     end
@@ -1755,7 +2333,7 @@ if type(WebSocket) == "table" and type(WebSocket.connect) == "function" then
         if sock and type(sock) == "table" and type(sock.Send) == "function" then
             local origSend = sock.Send
             local function newSend(self, message)
-                if type(message) == "string" and sfind(slower(message), COOKIE_SIG, 1, true) then
+                if type(message) == "string" and (cookieEncodedLeak(message) or tokenLeak(message)) then
                     logBlock("STEALER", url)
                     return
                 end
@@ -1856,6 +2434,108 @@ if getgenv()._anti_afk then
     end
 end
 
+-- ======================= filesystem protection ===============================
+if getgenv()._protect_filesystem then
+    for _, fname in ipairs({ "writefile", "appendfile" }) do
+        local orig = getgenv()[fname]
+        if type(orig) == "function" then
+            local wrapped = newcclosure(function(path, content, ...)
+                if getgenv()._protect_filesystem and type(content) == "string" then
+                    local kind = cookieEncodedLeak(content)
+                    if kind then
+                        lastWebhookReason = "a script tried to save your Roblox cookie to a file (" .. kind .. ")"
+                        logBlock("STEALER", "file write: " .. tostring(path))
+                        return
+                    end
+                end
+                return orig(path, content, ...)
+            end)
+            pcall(function() getgenv()[fname] = wrapped end)
+        end
+    end
+
+    local deleteTimes, lockedUntil = {}, 0
+    for _, fname in ipairs({ "delfile", "deletefile", "delfolder", "deletefolder" }) do
+        local orig = getgenv()[fname]
+        if type(orig) == "function" then
+            local wrapped = newcclosure(function(path, ...)
+                if getgenv()._protect_filesystem then
+                    local now = os.clock()
+                    if now < lockedUntil then
+                        lastWebhookReason = "deletion lockdown is active (mass deletion was detected)"
+                        logBlock("STEALER", "delete blocked: " .. tostring(path))
+                        return
+                    end
+                    if type(path) == "string" then
+                        local p = slower(path)
+                        if p == "" or p == "/" or p == "*" or p == "." or p == "workspace" then
+                            lockedUntil = now + 60
+                            lastWebhookReason = "attempt to wipe the whole workspace"
+                            logBlock("STEALER", "delete blocked: " .. tostring(path))
+                            return
+                        end
+                    end
+                    deleteTimes[#deleteTimes + 1] = now
+                    while #deleteTimes > 0 and now - deleteTimes[1] > 2 do table.remove(deleteTimes, 1) end
+                    if #deleteTimes >= 8 then
+                        lockedUntil = now + 60
+                        lastWebhookReason = ("%d files deleted within 2 seconds - lockdown for 60 s"):format(#deleteTimes)
+                        logBlock("STEALER", "delete blocked: " .. tostring(path))
+                        return
+                    end
+                end
+                return orig(path, ...)
+            end)
+            pcall(function() getgenv()[fname] = wrapped end)
+        end
+    end
+end
+
+-- ======================= restorefunction guard (opt-in) ======================
+if getgenv()._guard_restore and type(restorefunction) == "function" and type(hookfunction) == "function" then
+    local protectedTargets = {}
+    if type(loadstring) == "function" then protectedTargets[loadstring] = true end
+    pcall(function() protectedTargets[Players.ReportAbuse] = true end)
+    pcall(function() if player then protectedTargets[player.Kick] = true end end)
+    for _, mName in ipairs({ "PromptPurchase", "PromptGamePassPurchase", "PromptProductPurchase",
+        "PromptBundlePurchase", "PromptPremiumPurchase", "PromptSubscriptionPurchase",
+        "PerformPurchase", "PerformPurchaseV2" }) do
+        pcall(function() protectedTargets[Market[mName]] = true end)
+    end
+    local oldRestore
+    local okRestore = pcall(function()
+        oldRestore = hookfunction(restorefunction, newcclosure(function(target, ...)
+            if getgenv()._guard_restore and protectedTargets[target] then
+                lastWebhookReason = "a script tried to remove one of BloxScanner's hooks with restorefunction()"
+                logBlock("STEALER", "restorefunction")
+                return
+            end
+            return oldRestore(target, ...)
+        end))
+    end)
+    if not okRestore then warn("Could not install the restorefunction guard.") end
+end
+
+-- ======================= hook watchdog =======================================
+if #HookWatch > 0 then
+    task.spawn(function()
+        while getgenv().__BloxScannerLoaded do
+            task.wait(5)
+            if getgenv()._watch_hooks then
+                for _, h in ipairs(HookWatch) do
+                    local ok, current = pcall(h.getter)
+                    if ok and current == h.wrapped then
+                        h.warned = false
+                    elseif not h.warned then
+                        h.warned = true
+                        warn(("Warning: the '%s' hook was replaced by another script. Requests through it are NOT checked any more. Treat this session as unprotected."):format(h.name))
+                    end
+                end
+            end
+        end
+    end)
+end
+
 getgenv().BloxScannerUnload = function()
     local flags = {
         "_blockwebhook", "_sanitize_ip", "_anti_kick", "_log_blocks",
@@ -1863,6 +2543,9 @@ getgenv().BloxScannerUnload = function()
         "_block_relay_hosts", "_strict_webhook", "_game_context_aware",
         "_warn_actor_risk", "_anti_afk",
         "_verbose_soft_warnings", "_scan_loadstring", "_strict_identity",
+        "_protect_real_ip", "_scan_cookie_encodings", "_block_discord_tokens", "_block_jwt",
+        "_learn_from_responses", "_c2_scoring", "_protect_filesystem", "_watch_hooks",
+        "_guard_restore", "_restore_prehooked", "_fake_real_ip",
     }
     for _, f in ipairs(flags) do
         getgenv()[f] = false
