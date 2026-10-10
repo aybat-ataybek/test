@@ -8,9 +8,21 @@ ENV.FakeName = ENV.FakeName or ".test"
 ENV.FakeDisplay = ENV.FakeDisplay or ".test"
 ENV.Badge = ENV.Badge or "roblox-plus"
 
+ENV.NameColor = ENV.NameColor or "#FFFFFF"
+ENV.DisplayColor = ENV.DisplayColor or "#FFFFFF"
+ENV.BadgeColor = ENV.BadgeColor or "#0066FF"
+
+local function validColor(color, fallback)
+    if type(color) == "string"
+        and color:match("^#%x%x%x%x%x%x$") then
+        return color
+    end
+
+    return fallback
+end
+
 local CONFIG = {
     IconFont = "rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json",
-    Blue = "#0066FF",
     Separator = " "
 }
 
@@ -25,32 +37,44 @@ local RealName = LocalPlayer.Name
 local RealDisplay = LocalPlayer.DisplayName
 
 local function escapeRichText(text)
-    return text:gsub("&", "&amp;")
+    return tostring(text)
+        :gsub("&", "&amp;")
         :gsub("<", "&lt;")
         :gsub(">", "&gt;")
         :gsub('"', "&quot;")
         :gsub("'", "&apos;")
 end
 
+local function coloredText(text, color)
+    color = validColor(color, "#FFFFFF")
+
+    return '<font color="' .. color .. '">'
+        .. escapeRichText(text)
+        .. '</font>'
+end
+
 local function badgeText(name)
     local badge = BADGES[ENV.Badge] or BADGES["roblox-plus"]
+    local nameColor = validColor(ENV.DisplayColor, "#FFFFFF")
+    local badgeColor = validColor(ENV.BadgeColor, "#0066FF")
 
-    return escapeRichText(name)
+    return '<font color="' .. nameColor .. '">'
+        .. escapeRichText(name)
+        .. '</font>'
         .. CONFIG.Separator
-        .. '<font color="' .. CONFIG.Blue
+        .. '<font color="' .. badgeColor
         .. '" family="' .. CONFIG.IconFont
         .. '"><b>' .. escapeRichText(badge)
         .. '</b></font>'
 end
-
-local TargetName = ENV.FakeName
 
 local function replaceNames(text)
     if not text or text == "" then
         return text
     end
 
-    if text:find(ENV.FakeDisplay, 1, true) then
+    if text:find(ENV.FakeDisplay, 1, true)
+        or text:find(ENV.FakeName, 1, true) then
         return text
     end
 
@@ -59,7 +83,7 @@ local function replaceNames(text)
     end
 
     if text == RealName then
-        return TargetName
+        return coloredText(ENV.FakeName, ENV.NameColor)
     end
 
     local result = text
@@ -82,7 +106,7 @@ local function replaceNames(text)
         )
 
         result = result:gsub(escapedName, function()
-            return TargetName
+            return coloredText(ENV.FakeName, ENV.NameColor)
         end)
     end
 
@@ -121,11 +145,7 @@ local function monitorText(obj)
 
         if updated ~= original then
             updating = true
-
-            if updated:find("<font", 1, true) then
-                obj.RichText = true
-            end
-
+            obj.RichText = true
             obj.Text = updated
             updating = false
         end
@@ -180,11 +200,7 @@ Workspace.DescendantAdded:Connect(function(obj)
 end)
 
 local function monitorCharacter(character)
-    local humanoid = character:WaitForChild("Humanoid", 10)
-
-    if not humanoid then
-        return
-    end
+    character:WaitForChild("Humanoid", 10)
 
     for _, obj in ipairs(character:GetDescendants()) do
         if obj:IsA("BillboardGui") then
