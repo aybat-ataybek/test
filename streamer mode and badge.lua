@@ -4,7 +4,7 @@ local Workspace = game:GetService("Workspace")
 
 local ENV = getgenv()
 
-ENV.FakeName = ENV.FakeName or ".aybat"
+ENV.FakeName = ENV.FakeName or ".test"
 ENV.FakeDisplay = ENV.FakeDisplay or ".test"
 ENV.Badge = ENV.Badge or "roblox-plus"
 
