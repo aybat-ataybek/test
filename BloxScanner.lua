@@ -1,7 +1,14 @@
--- :) i love you, thank you for using script
 
--- ===== Your settings (everything else is in DEFAULTS below) =====
-getgenv()._anti_reportabuse = true
+--[[
+  █████╗  ██╗   ██╗ ██████╗   █████╗  ████████╗
+ ██╔══██╗ ╚██╗ ██╔╝ ██╔══██╗ ██╔══██╗ ╚══██╔══╝
+ ███████║  ╚████╔╝  ██████╔╝ ███████║    ██║
+ ██╔══██║   ╚██╔╝   ██╔══██╗ ██╔══██║    ██║
+ ██║  ██║    ██║    ██████╔╝ ██║  ██║    ██║
+ ╚═╝  ╚═╝    ╚═╝    ╚═════╝  ╚═╝  ╚═╝    ╚═╝
+]]
+
+-- ===== Your settings (everything else is in DEFAULTS below) =====getgenv()._anti_reportabuse = true
 getgenv()._anti_robux_prompt = true
 getgenv()._whitelist = {
     "roblox.com",
