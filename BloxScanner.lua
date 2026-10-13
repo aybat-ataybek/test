@@ -1,55 +1,78 @@
--- BloxScanner (improved)
--- Changes: roproxy GET allowed; hwid-only requests no longer blocked (see _strict_identity);
--- single __namecall hook with no allocation on the hot path (kick check merged in, cloneref-safe);
--- Player.Kick dot-call hook; loadstring scanner now decodes "a".."b", \ddd, \xHH, string.char;
--- loadstring whitelist: plain text only skips soft checks, "sha256:<hex>" skips everything;
--- IP sanitizer leaves downloaded Lua code untouched; multi-label blacklist entries now match;
--- duplicate block logs collapsed; request wrappers are newcclosure; http.request hooked.
-
 -- :) i love you, thank you for using script
 
-if getgenv().__BloxScannerLoaded then
-    warn("Already loaded; skipping re-execution to avoid stacking hooks.")
+-- ===== Your settings (everything else is in DEFAULTS below) =====
+getgenv()._anti_reportabuse = true
+getgenv()._anti_robux_prompt = true
+getgenv()._whitelist = {
+    "roblox.com",
+    "rbxcdn.com",
+}
+
+-- Scripts you trust, listed by the URL you pass to game:HttpGet.
+-- Put the URL as a string. Do NOT write loadstring(...)() here: that would
+-- run the script right now, before the scanner is loaded.
+getgenv()._Scripts_whitelist = {
+    "https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source",
+}
+
+getgenv()._icon_asset = "rbxassetid://83768500686029"
+-- ================================================================
+
+local genv = getgenv()
+
+-- Re-execution guard. If the scanner was unloaded earlier, just switch it back
+-- on instead of stacking a second set of hooks on top of the first.
+local State = genv.__BloxScannerState
+if State then
+    if State.alive then
+        warn("Already loaded; skipping re-execution to avoid stacking hooks.")
+    else
+        State.alive = true
+        warn("Re-enabled. Hooks from the first run are still installed.")
+    end
     return
 end
-getgenv().__BloxScannerLoaded = true
+State = { alive = true }
+genv.__BloxScannerState = State
+genv.__BloxScannerLoaded = true
 
-local function setDefault(key, value)
-    if getgenv()[key] == nil then
-        getgenv()[key] = value
-    end
-end
+-- All options live here. Set any of them in getgenv() BEFORE running the
+-- script (e.g. getgenv()._anti_afk = false) to override the default.
+-- Nothing is written into getgenv(); defaults are resolved on read, so a flag
+-- can still be toggled live at any time.
+local DEFAULTS = {
+    _blockwebhook          = true,
+    _sanitize_ip           = true,
+    _log_blocks            = true,
+    _anti_kick             = true,
+    _scan_loadstring       = true,
+    _verbose_soft_warnings = false,
 
-setDefault("_blockwebhook",          true)
-setDefault("_sanitize_ip",           true)
-setDefault("_log_blocks",            true)
-setDefault("_anti_kick",             true)
-setDefault("_scan_loadstring",       true)
-setDefault("_verbose_soft_warnings", false)
+    _block_bare_ip         = true,
+    _block_relay_hosts     = true,
 
-setDefault("_anti_reportabuse",      true)
-setDefault("_anti_robux_prompt",     true)
+    _strict_webhook        = false,
+    _game_context_aware    = true,
+    _warn_actor_risk       = true,
+    _anti_afk              = true,
 
-setDefault("_block_bare_ip",         true)
-setDefault("_block_relay_hosts",     true)
+    -- clipboard / disk exfiltration channels
+    _block_clipboard_exfil = true,
+    _block_writefile_exfil = true,
 
-setDefault("_strict_webhook",        false)
-setDefault("_game_context_aware",    true)
-setDefault("_warn_actor_risk",       true)
+}
 
-setDefault("_anti_afk",              true)
-
--- true  = a single device-identifying field (hwid, machineid...) sent to a relay/tunnel host is blocked.
--- false = needs 2+ such fields (key/licence systems send just hwid, so they are allowed with a notice).
-setDefault("_strict_identity",       false)
-
-setDefault("_icon_asset", "rbxassetid://83768500686029")
-
-setDefault("_whitelist", {
-    "roblox.com", "rbxcdn.com",
+-- Cfg._name -> user value from getgenv(), else the default.
+-- After BloxScannerUnload() every lookup returns false, so every check that
+-- reads Cfg at call time switches itself off.
+local Cfg = setmetatable({}, {
+    __index = function(_, key)
+        if not State.alive then return false end
+        local v = genv[key]
+        if v == nil then v = DEFAULTS[key] end
+        return v
+    end,
 })
-
-setDefault("_loadstring_whitelist", {})
 
 local realGame = cloneref(game)
 local HttpService = cloneref(game:GetService("HttpService"))
@@ -102,35 +125,20 @@ local function getHost(url)
     return slower(host)
 end
 
+local function hostMatches(host, suffix)
+    return host == suffix
+        or (#host > #suffix and host:sub(-(#suffix + 1)) == "." .. suffix)
+end
+
 local function isWhitelisted(host)
     if not host or host == "" then return false end
-    for _, w in ipairs(getgenv()._whitelist or {}) do
+    for _, w in ipairs(Cfg._whitelist or {}) do
         w = slower(w)
-        if host == w or (#host > #w and host:sub(-(#w + 1)) == "." .. w) then
+        if hostMatches(host, w) then
             return true
         end
     end
     return false
-end
-
--- Hosts that only proxy public Roblox APIs. GET requests to them are allowed
--- (cookie / token checks still apply, and POST is still fully checked).
-local READONLY_API_HOSTS = { "roproxy.com" }
-
-local function isReadOnlyApiHost(host)
-    for _, s in ipairs(READONLY_API_HOSTS) do
-        if host == s or (#host > #s and host:sub(-(#s + 1)) == "." .. s) then
-            return true
-        end
-    end
-    return false
-end
-
-local noticed = {}
-local function noticeOnce(key, msg)
-    if noticed[key] then return end
-    noticed[key] = true
-    if getgenv()._log_blocks then warn(msg) end
 end
 
 local function fakeIPv4()
@@ -188,7 +196,7 @@ local BLACKLIST = {
     "logip.net", "trackip.net", "ip-tracker.net", "ipgrabber", "ipgraber",
     "iplis.ru", "iplog.co", "maper.info", "ps3cfw.com", "wl.gl", "bc.ax",
     "ed.tc", "ezstat.ru", "02ip.ru", "browserleaks", "whoer", "ipleak",
-    "canarytokens",
+    "canarytokens", "roproxy",
     "roware.space", "globalcheats.cc", "darkscripts", "egorikusa",
     "hookbin", "pipedream", "webhook-test.com",
     "webhook.site", "webhook.in", "hook.io",
@@ -496,20 +504,16 @@ local KnownExfilHosts = {
     ["proxy-plum-beta.vercel.app"] = true,
 }
 
--- STRONG: one match is enough to block (credentials / session data).
-local StrongBodyFields = {
+local SensitiveBodyFields = {
+
     "roblosec" .. "urity", "getauthticket", "authticket", "auth_ticket",
     ".robloxsecurity", "securitytoken", "x-csrf-token", "csrftoken",
     "cookie", "cookies", "sessionid", "session_id", "refreshtoken",
     "accesstoken", "access_token",
-}
 
--- WEAK: identify the device / account but are also sent by normal key and
--- licence systems. One match = allowed + notice; two or more = blocked
--- (or one match when getgenv()._strict_identity = true).
-local WeakBodyFields = {
     "clientid", "client_id", "sessionlogid", "playsessionid",
     "hwid", "hardwareid", "machineid", "identityhash",
+
     "inventory", "backpack_items", "iteminventory", "ownedgamepasses",
     "collectibles", "limiteds", "totalrap", "networth",
 }
@@ -558,26 +562,14 @@ local function countFieldHits(bodyStr, fields)
     return hits, firstHit
 end
 
--- returns: shouldBlock, reason, weakFieldSeen
--- strictWeak = true is used for real webhook endpoints (Discord, Telegram...)
--- where even a single identifying field is suspicious.
-local function webhookBodyVerdict(bodyStr, strictWeak)
-    local strong, which = countFieldHits(bodyStr, StrongBodyFields)
-    if strong > 0 then
+local function webhookBodyVerdict(bodyStr)
+    local sensitive, which = countFieldHits(bodyStr, SensitiveBodyFields)
+    if sensitive > 0 then
         return true, "sensitive field in body: \"" .. tostring(which) ..
-                     "\" (total matches: " .. strong .. ")", nil
+                     "\" (total matches: " .. sensitive .. ")"
     end
 
-    local weak, weakWhich = countFieldHits(bodyStr, WeakBodyFields)
-    local threshold = (strictWeak or getgenv()._strict_identity) and 1 or 2
-    if weak >= threshold then
-        return true, "device-identifying field in body: \"" .. tostring(weakWhich) ..
-                     "\" (total matches: " .. weak .. ")", nil
-    end
-    if weak > 0 then
-        return false, nil, weakWhich
-    end
-    return false, nil, nil
+    return false, nil
 end
 
 local LocationFields = {
@@ -664,7 +656,7 @@ do
                 GameContextWords[w] = true
             end
         end
-        if next(GameContextWords) ~= nil and getgenv()._log_blocks then
+        if next(GameContextWords) ~= nil and Cfg._log_blocks then
             local list = {}
             for w in pairs(GameContextWords) do list[#list + 1] = w end
             warn(("Game context \"%s\": the words {%s} are not treated as evidence in this game.")
@@ -675,7 +667,7 @@ do
 end
 
 local function isForgivenByGameContext(word)
-    if not getgenv()._game_context_aware then return false end
+    if not Cfg._game_context_aware then return false end
     return GameContextWords[word:lower()] == true
 end
 
@@ -721,7 +713,10 @@ local function downloadImage(url)
     end)
 
     if success and res then
-        pcall(function() writefile(filename, res) end)
+        -- Added (point 7): writefile is wrapped later; use the original saved
+        -- reference so our own PNG writes are never second-guessed by the guard.
+        local w = genv.__BloxScannerOrigWritefile or writefile
+        pcall(function() w(filename, res) end)
         autoDeleteFile(filename)
         if getcustomasset then
             return getcustomasset(filename)
@@ -752,7 +747,7 @@ local CONFIG = {
     MIN_HEIGHT = 55,
     TOAST_HEIGHT_FULL = 77,
     TOAST_HEIGHT_SMALL = 55,
-    DEFAULT_ICON = getgenv()._icon_asset or "rbxassetid://83768500686029",
+    DEFAULT_ICON = Cfg._icon_asset or "rbxassetid://83768500686029",
 }
 
 local currentToast = nil
@@ -983,23 +978,8 @@ local function NotifyToast(config)
     end)
 end
 
-local lastLog, lastLogN = {}, 0
-
 local function logBlock(tag, url)
-    if not getgenv()._log_blocks then return end
-
-    -- the same block repeated within 3 seconds is shown only once
-    do
-        local key = tostring(tag) .. "|" .. tostring(url)
-        local now = os.clock()
-        if lastLog[key] and now - lastLog[key] < 3 then
-            lastWebhookReason = nil
-            return
-        end
-        lastLogN = lastLogN + 1
-        if lastLogN > 200 then lastLog, lastLogN = {}, 1 end
-        lastLog[key] = now
-    end
+    if not Cfg._log_blocks then return end
     local source = getCallingScriptName()
 
     local consoleTitle
@@ -1035,7 +1015,7 @@ local function logBlock(tag, url)
 end
 
 local function logKick()
-    if not getgenv()._log_blocks then return end
+    if not Cfg._log_blocks then return end
     local source = getCallingScriptName()
     warn("╔═════════━━━ • ━━━═════════╗")
     warn("[ STEALER - BLOCKED ]")
@@ -1053,7 +1033,7 @@ local function logKick()
 end
 
 local function logReportAbuse()
-    if not getgenv()._log_blocks then return end
+    if not Cfg._log_blocks then return end
     local source = getCallingScriptName()
     warn("╔═════════━━━ • ━━━═════════╗")
     warn("[ REPORTABUSE - BLOCKED ]")
@@ -1071,7 +1051,7 @@ local function logReportAbuse()
 end
 
 local function logRobuxPrompt(methodName, productId, ownerName, price)
-    if not getgenv()._log_blocks then return end
+    if not Cfg._log_blocks then return end
     local source = getCallingScriptName()
     warn("╔═════════━━━ • ━━━═════════╗")
     warn("[ ROBUX PROMPT - BLOCKED ]")
@@ -1090,6 +1070,40 @@ local function logRobuxPrompt(methodName, productId, ownerName, price)
         duration = 6,
         icon = CONFIG.DEFAULT_ICON
     })
+end
+
+-- Added (point 7): unified logger for clipboard / disk exfiltration
+local function logExfil(channel, reason)
+    if not Cfg._log_blocks then return end
+    local source = getCallingScriptName()
+    warn("╔═════════━━━ • ━━━═════════╗")
+    warn("[ STEALER - BLOCKED ]")
+    warn("Time : " .. os.date("%H:%M:%S"))
+    warn("Channel : " .. tostring(channel))
+    warn("Source script : " .. source)
+    warn("Reason : " .. tostring(reason))
+    warn("╚═════════━━━ • ━━━═════════╝")
+
+    NotifyToast({
+        title = "STEALER - BLOCKED",
+        content = tostring(channel) .. " exfiltration blocked. Details in console.",
+        duration = 6,
+        icon = CONFIG.DEFAULT_ICON
+    })
+end
+
+-- Added (point 7): hard-signature test for raw credential payloads.
+-- Kept deliberately narrow (cookie / auth ticket only) so legitimate
+-- clipboard copies and config/image writes are not false-flagged.
+local function payloadHasHardCredential(s)
+    if type(s) ~= "string" or s == "" then return false, nil end
+    local low = slower(s)
+    if sfind(low, COOKIE_SIG, 1, true) then return true, "roblox cookie signature" end
+    if sfind(low, "roblosecur" .. "ity", 1, true) then return true, "roblox cookie" end
+    if sfind(low, "getauthticket", 1, true) or sfind(low, "authticket", 1, true) then
+        return true, "auth ticket"
+    end
+    return false, nil
 end
 
 local function hasSuspiciousHeaders(headers)
@@ -1125,6 +1139,7 @@ local function bodyLeaksLocationFields(body)
 end
 
 isBlocked = function(url, body, headers, isPost)
+    if not State.alive then return false, nil end
     if type(url) ~= "string" or url == "" then return false, nil end
     local dUrl = urlDecode(url)
     local host = getHost(dUrl)
@@ -1136,22 +1151,13 @@ isBlocked = function(url, body, headers, isPost)
     local COOKIE_SIG_WORD_2 = "roblosecur" .. "ity"
     if sfind(ul, COOKIE_SIG, 1, true) or sfind(ul, COOKIE_SIG_WORD_2, 1, true) or
        sfind(bl, COOKIE_SIG, 1, true) or sfind(bl, COOKIE_SIG_WORD_2, 1, true) then
-        if not (host == "roblox.com" or host:sub(-11) == ".roblox.com") then
+        if not hostMatches(host, "roblox.com") then
             return true, "STEALER"
         end
     end
 
     if isWhitelisted(host) then
         return false, nil
-    end
-
-    -- read-only Roblox API proxies (roproxy): allow plain GET lookups
-    if not isPost and isReadOnlyApiHost(host) then
-        local qs = pl:match("%?(.*)$")
-        local bad = qs and webhookBodyVerdict(qs, true)
-        if not bad then
-            return false, nil
-        end
     end
 
     if isExactBlacklisted(host) then
@@ -1162,7 +1168,7 @@ isBlocked = function(url, body, headers, isPost)
         return true, "STEALER"
     end
 
-    if getgenv()._block_bare_ip then
+    if Cfg._block_bare_ip then
         local a, b, c, d = smatch(host, "^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
         if a then
             a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
@@ -1178,10 +1184,10 @@ isBlocked = function(url, body, headers, isPost)
         end
     end
 
-    if getgenv()._block_relay_hosts then
+    if Cfg._block_relay_hosts then
         local isRelayHost = false
         for _, suffix in ipairs(RelayHostSuffixes) do
-            if host == suffix or host:sub(-(#suffix + 1)) == "." .. suffix then
+            if hostMatches(host, suffix) then
                 isRelayHost = true
                 break
             end
@@ -1189,14 +1195,12 @@ isBlocked = function(url, body, headers, isPost)
 
         if isRelayHost then
 
-            local shouldBlock, why, weak = webhookBodyVerdict(bl)
+            local shouldBlock, why = webhookBodyVerdict(bl)
 
             if not shouldBlock and not isPost then
                 local qs = pl:match("%?(.*)$")
                 if qs then
-                    local qsWeak
-                    shouldBlock, why, qsWeak = webhookBodyVerdict(qs)
-                    weak = weak or qsWeak
+                    shouldBlock, why = webhookBodyVerdict(qs)
                     if shouldBlock then
                         why = "GET query string → " .. tostring(why)
                     end
@@ -1207,36 +1211,31 @@ isBlocked = function(url, body, headers, isPost)
                 lastWebhookReason = why
                 return true, "RELAY"
             end
-            if weak then
-                noticeOnce("weak:" .. host,
-                    ("Notice: %s received a device-identifying field (\"%s\"). Allowed - this looks like a key/licence system. "
-                     .. "Set getgenv()._strict_identity = true to block this kind of request."):format(host, tostring(weak)))
-            end
-            if getgenv()._verbose_soft_warnings then
+            if Cfg._verbose_soft_warnings then
                 warn(("Allowed request to relay platform (no sensitive data): %s (%s)")
                      :format(tostring(host), isPost and "POST" or "GET"))
             end
         end
     end
 
-    if getgenv()._blockwebhook and isPost then
+    if Cfg._blockwebhook and isPost then
         for _, pat in ipairs(WebhookPatterns) do
             local hostSuffix, pathSub = pat[1], pat[2]
-            local hostMatches = (host == hostSuffix or host:sub(-(#hostSuffix + 1)) == "." .. hostSuffix)
-            if hostMatches and (pathSub == "" or sfind(pl, pathSub, 1, true)) then
+            local hostOk = hostMatches(host, hostSuffix)
+            if hostOk and (pathSub == "" or sfind(pl, pathSub, 1, true)) then
 
-                if getgenv()._strict_webhook then
+                if Cfg._strict_webhook then
 
                     return true, "WEBHOOK"
                 end
 
-                local shouldBlock, why = webhookBodyVerdict(bl, true)
+                local shouldBlock, why = webhookBodyVerdict(bl)
                 if shouldBlock then
                     lastWebhookReason = why
                     return true, "WEBHOOK"
                 end
 
-                if getgenv()._verbose_soft_warnings then
+                if Cfg._verbose_soft_warnings then
                     warn("Allowed webhook (no sensitive data): " .. tostring(host))
                 end
             end
@@ -1248,13 +1247,8 @@ isBlocked = function(url, body, headers, isPost)
         hostLabels[#hostLabels + 1] = label
     end
 
-    local paddedHost = "." .. host .. "."
     for _, p in ipairs(BLACKLIST) do
-        if host == p or host:sub(-(#p + 1)) == "." .. p then
-            return true, "LOGGER"
-        end
-        -- multi-label entries ("checkip.amazonaws") match as whole labels inside the host
-        if sfind(p, ".", 1, true) and sfind(paddedHost, "." .. p .. ".", 1, true) then
+        if hostMatches(host, p) then
             return true, "LOGGER"
         end
         for _, label in ipairs(hostLabels) do
@@ -1273,7 +1267,7 @@ isBlocked = function(url, body, headers, isPost)
     end
 
     for _, tld in ipairs(SuspiciousTLDs) do
-        if host:sub(-(#tld + 1)) == "." .. tld then
+        if hostMatches(host, tld) then
             return true, "LOGGER"
         end
     end
@@ -1289,23 +1283,83 @@ isBlocked = function(url, body, headers, isPost)
     return false, nil
 end
 
-local function looksLikeLuaCode(s)
-    local head = s:sub(1, 4000)
-    if sfind(head, "game:GetService", 1, true) or sfind(head, "getgenv()", 1, true)
-       or sfind(head, "loadstring", 1, true) or sfind(head, "return function", 1, true) then
-        return true
+-- =========================================================================
+-- Added (point 6): mask integer / hex IP values.
+--
+-- Scoped ONLY to values that sit under an IP-context key (ip, ipv4, host,
+-- addr, publicip ...). A blanket replacement of any 32-bit integer would
+-- destroy Roblox UserIds, scores and timestamps, which fall in the same
+-- numeric range — so this stays key-anchored on purpose.
+-- =========================================================================
+local IP_VALUE_KEYS = {
+    "ip", "ipv4", "ipaddress", "ip_address", "publicip", "public_ip",
+    "clientip", "client_ip", "remoteip", "remote_ip", "addr", "address",
+    "host", "query", "origin",
+}
+
+local function intToIPv4(n)
+    n = tonumber(n)
+    if not n or n < 0 or n > 4294967295 or n ~= math.floor(n) then return nil end
+    local a = math.floor(n / 16777216) % 256
+    local b = math.floor(n / 65536) % 256
+    local c = math.floor(n / 256) % 256
+    local d = n % 256
+    return a, b, c, d
+end
+
+local function looksLikeHostedIPInt(n)
+    -- Reject obviously non-IP integers to limit false positives:
+    -- very small values and values that decode to reserved/local ranges.
+    local a, b = intToIPv4(n)
+    if not a then return false end
+    if a == 0 or a == 127 or a == 10 then return false end
+    if a == 192 and b == 168 then return false end
+    if a == 172 and b >= 16 and b <= 31 then return false end
+    -- Require the top octet to be a plausible public first octet.
+    if a >= 1 and a <= 223 then return true end
+    return false
+end
+
+local function maskIntHexIPsInKeyedValues(s, replacement)
+    if type(s) ~= "string" or s == "" then return s, 0 end
+    local changed = 0
+
+    for _, key in ipairs(IP_VALUE_KEYS) do
+        -- JSON numeric value:  "ip": 3232235521
+        s = s:gsub('("' .. key .. '"%s*:%s*)(%d+)', function(pre, num)
+            if #num >= 7 and looksLikeHostedIPInt(num) then
+                changed = changed + 1
+                return pre .. replacement
+            end
+            return pre .. num
+        end)
+        -- JSON hex string value: "ip":"0xC0A80001"
+        s = s:gsub('("' .. key .. '"%s*:%s*")(0[xX]%x+)(")', function(pre, hx, post)
+            local n = tonumber(hx)
+            if n and looksLikeHostedIPInt(n) then
+                changed = changed + 1
+                return pre .. replacement .. post
+            end
+            return pre .. hx .. post
+        end)
+        -- Query-string numeric value:  &ip=3232235521  / ?ip=...
+        s = s:gsub('([%?&]' .. key .. '=)(%d+)', function(pre, num)
+            if #num >= 7 and looksLikeHostedIPInt(num) then
+                changed = changed + 1
+                return pre .. replacement
+            end
+            return pre .. num
+        end)
     end
-    return sfind(head, "local ", 1, true) ~= nil
-       and (sfind(head, "function", 1, true) ~= nil or sfind(head, "\nend", 1, true) ~= nil)
+
+    return s, changed
 end
 
 local function sanitizeBody(bodyStr, host)
     if type(bodyStr) ~= "string" or bodyStr == "" then return bodyStr end
-    if not getgenv()._sanitize_ip then return bodyStr end
+    if not Cfg._sanitize_ip then return bodyStr end
 
     if host and isWhitelisted(host) then return bodyStr end
-    -- scripts fetched for loadstring must stay byte-for-byte intact
-    if looksLikeLuaCode(bodyStr) then return bodyStr end
 
     local ipv4, ipv6 = fakeIPv4(), fakeIPv6()
 
@@ -1373,6 +1427,9 @@ local function sanitizeBody(bodyStr, host)
         return nil
     end)
 
+    -- Added (point 6): mask integer / hex IPs that sit under IP-context keys.
+    out = maskIntHexIPsInKeyedValues(out, ipv4)
+
     if stashN > 0 then
         for token, val in pairs(stash) do
             out = out:gsub(token, val)
@@ -1382,138 +1439,86 @@ local function sanitizeBody(bodyStr, host)
     return out
 end
 
--- Lower-cases the code and undoes cheap obfuscation tricks that hide
--- signatures: "a".."b" concatenation, \ddd / \xHH escapes, string.char(...).
-local function codeNormalize(src)
-    local ok, res = pcall(function()
-        local s = src:lower()
-        if #s > 3000000 then return s end
-        s = gsub(s, "\\x(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
-        s = gsub(s, "\\(%d%d?%d?)", function(d)
-            local n = tonumber(d)
-            if n and n < 256 then return string.char(n) end
-        end)
-        s = gsub(s, "string%.char%s*%(([%d%s,]+)%)", function(list)
-            local parts = {}
-            for n in list:gmatch("%d+") do
-                local v = tonumber(n)
-                if not v or v > 255 then return nil end
-                parts[#parts + 1] = string.char(v)
-            end
-            return '"' .. table.concat(parts) .. '"'
-        end)
-        for _ = 1, 4 do
-            local before = s
-            s = gsub(s, "[\"']%s*%.%.%s*[\"']", "")
-            if s == before then break end
-        end
-        return s
-    end)
-    if ok and type(res) == "string" then return res end
-    return src:lower()
-end
+-- Source text of every whitelisted script that was downloaded through
+-- game:HttpGet. loadstring() skips the scan for exactly this text.
+local TrustedSources = {}
 
-local function codeSha256(code)
-    if type(crypt) == "table" and type(crypt.hash) == "function" then
-        local ok, h = pcall(crypt.hash, code, "sha256")
-        if ok and type(h) == "string" then return h:lower() end
+local function isTrustedScriptUrl(url)
+    if type(url) ~= "string" then return false end
+    for _, u in ipairs(Cfg._Scripts_whitelist or {}) do
+        if u == url then return true end
     end
-    return nil
+    return false
 end
 
-if getgenv()._scan_loadstring and hookfunction and type(loadstring) == "function" then
+local function blockCode(source, reason)
+    warn("╔═════════━━━ • ━━━═════════╗")
+    warn("[ STEALER - BLOCKED ]")
+    warn("Time : " .. os.date("%H:%M:%S"))
+    warn("Source script : " .. source)
+    warn("Reason : " .. reason)
+    warn("╚═════════━━━ • ━━━═════════╝")
+    NotifyToast({
+        title = "STEALER - BLOCKED",
+        content = "Learn more in the console...",
+        duration = 5,
+        icon = CONFIG.DEFAULT_ICON
+    })
+    return newcclosure(function() end)
+end
+
+if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
     local origLoadstring
-
-    local function blockCode(reason)
-        local source = getCallingScriptName()
-        warn("╔═════════━━━ • ━━━═════════╗")
-        warn("[ STEALER - BLOCKED ]")
-        warn("Time : " .. os.date("%H:%M:%S"))
-        warn("Source script : " .. source)
-        warn("Reason : " .. reason)
-        warn("╚═════════━━━ • ━━━═════════╝")
-        NotifyToast({
-            title = "STEALER - BLOCKED",
-            content = "Learn more in the console...",
-            duration = 5,
-            icon = CONFIG.DEFAULT_ICON
-        })
-        return newcclosure(function() end)
-    end
-
     origLoadstring = hookfunction(loadstring, newcclosure(function(code, chunkname)
-        if not getgenv()._scan_loadstring or type(code) ~= "string" then
+        if not Cfg._scan_loadstring or TrustedSources[code] then
             return origLoadstring(code, chunkname)
         end
-
-        -- Whitelist:
-        --   "sha256:<hex>"  -> exact script, skips ALL checks (needs crypt.hash)
-        --   any other text  -> must appear in the first 300 chars; skips only the
-        --                      soft (warning-only) checks. Hard signatures always run,
-        --                      so a stealer cannot pass by pasting a trusted word.
-        local softTrusted = false
-        local wl = getgenv()._loadstring_whitelist
-        if type(wl) == "table" and #wl > 0 then
-            local head = slower(code:sub(1, 300))
-            local hash
-            for _, w in ipairs(wl) do
-                if type(w) == "string" and w ~= "" then
-                    if slower(w:sub(1, 7)) == "sha256:" then
-                        if hash == nil then hash = codeSha256(code) or false end
-                        if hash and hash == slower(w:sub(8)) then
-                            return origLoadstring(code, chunkname)
-                        end
-                    elseif sfind(head, slower(w), 1, true) then
-                        softTrusted = true
-                    end
-                end
-            end
-        end
-
-        local norm = codeNormalize(code)
-        local compact = gsub(norm, "[%s%c]", "")
+        local codeStr = tostring(code):lower()
+        local source = getCallingScriptName()
 
         for _, word in ipairs(CodeBlacklistHard) do
-            if sfind(norm, word, 1, true) or sfind(compact, word, 1, true) then
-                return blockCode('hard signature "' .. word .. '"')
+            if sfind(codeStr, word, 1, true) then
+                return blockCode(source, 'hard signature "' .. word .. '"')
             end
         end
 
-        if softTrusted then
-            return origLoadstring(code, chunkname)
-        end
+        for _, word in ipairs(CodeBlacklistSoft) do
+            if sfind(codeStr, word, 1, true) then
 
-        for _, sig in ipairs(CodeSignaturePatterns) do
-            if sig.hard and smatch(norm, sig.pattern) then
-                return blockCode('pattern signature "' .. sig.label .. '"')
-            end
-        end
+                if isForgivenByGameContext(word) then
 
-        if getgenv()._verbose_soft_warnings then
-            local source = getCallingScriptName()
-
-            for _, word in ipairs(CodeBlacklistSoft) do
-                if sfind(norm, word, 1, true) and not isForgivenByGameContext(word) then
-                    warn(("Notice: loadstring from \"%s\" contains suspicious word \"%s\". Code was NOT blocked; this is a warning only.")
+                else
+                    if Cfg._verbose_soft_warnings then
+                        warn(("Notice: loadstring from \"%s\" contains suspicious word \"%s\". Code was NOT blocked; this is a warning only.")
                         :format(source, word))
+                    end
                     break
                 end
             end
+        end
 
-            for _, sig in ipairs(CodeSignaturePatterns) do
-                if not sig.hard and smatch(norm, sig.pattern) then
-                    warn(("Notice: loadstring from \"%s\" contains suspicious pattern \"%s\". Code was NOT blocked; this is a warning only.")
-                        :format(source, sig.label))
+        for _, sig in ipairs(CodeSignaturePatterns) do
+            local matched = smatch(codeStr, sig.pattern)
+            if matched then
+                if sig.hard then
+                    return blockCode(source, 'pattern signature "' .. sig.label .. '"')
+                else
+                    if Cfg._verbose_soft_warnings then
+                        warn(("Notice: loadstring from \"%s\" contains suspicious pattern \"%s\". Code was NOT blocked; this is a warning only.")
+                            :format(source, sig.label))
+                    end
                 end
             end
+        end
 
-            if sfind(norm, "webhook", 1, true) then
-                for _, marker in ipairs(ENV_INJECTION_MARKERS) do
-                    if sfind(norm, marker, 1, true) then
+        if sfind(codeStr, "webhook", 1, true) then
+            for _, marker in ipairs(ENV_INJECTION_MARKERS) do
+                if sfind(codeStr, marker, 1, true) then
+                    if Cfg._verbose_soft_warnings then
                         warn(("Notice: loadstring from \"%s\" contains a webhook plus marker \"%s\". Code was NOT blocked; this is a warning only.")
                             :format(source, marker))
-                        break
                     end
+                    break
                 end
             end
         end
@@ -1522,120 +1527,109 @@ if getgenv()._scan_loadstring and hookfunction and type(loadstring) == "function
     end))
 end
 
-local localUserId = player and player.UserId
-
--- Works for the real LocalPlayer and for cloneref'd copies of it.
-local function isLocalPlayer(inst)
-    if inst == player then return true end
-    local ok, res = _pcall(function()
-        return inst.ClassName == "Player" and inst.UserId == localUserId
-    end)
-    return ok and res == true
-end
-
-local WATCHED_METHODS = {
-    HttpGet = true, HttpGetAsync = true, GetAsync = true, GetObjects = true,
-    HttpPost = true, HttpPostAsync = true, PostAsync = true,
-    RequestAsync = true, ReportAbuse = true, Kick = true,
-}
-
 local oldNamecall
 local namecallHookOk, namecallHookErr = pcall(function()
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        local method = getnamecallmethod()
+    local method = getnamecallmethod()
+    local args = { ... }
+    local url = args[1]
+    local body = args[2]
 
-        -- hot path: almost every call leaves here without allocating anything
-        if not WATCHED_METHODS[method] then
-            return oldNamecall(self, ...)
+    if method == "HttpGet" or method == "HttpGetAsync" or method == "GetAsync" then
+        if isTrustedScriptUrl(url) then
+            local result = oldNamecall(self, ...)
+            if type(result) == "string" then TrustedSources[result] = true end
+            return result
         end
-
-        local url, body = ...
-
-        if method == "Kick" then
-            if getgenv()._anti_kick and isLocalPlayer(self) then
-                logKick()
-                return
+        local blocked, tag = isBlocked(url, nil, nil, false)
+        if blocked then
+            logBlock(tag, url)
+            return ""
+        end
+        local result = oldNamecall(self, ...)
+        if type(result) == "string" then
+            local respHost = getHost(urlDecode(url))
+            -- Added (point 4): a downloaded chunk can itself be a second-stage
+            -- stealer. Refuse the response if it carries a cookie/auth signature,
+            -- instead of handing stolen-credential code to loadstring.
+            if State.alive and not isWhitelisted(respHost) then
+                local low = slower(result)
+                if sfind(low, COOKIE_SIG, 1, true)
+                   or sfind(low, "roblosecur" .. "ity", 1, true)
+                   or sfind(low, "getauthticket", 1, true) then
+                    logBlock("STEALER", url)
+                    return ""
+                end
             end
-            return oldNamecall(self, ...)
+            return sanitizeBody(result, respHost)
+        end
+        return result
 
-        elseif method == "ReportAbuse" then
-            if getgenv()._anti_reportabuse and not checkcaller() then
-                logReportAbuse()
-                return
-            end
-            return oldNamecall(self, ...)
-
-        elseif method == "HttpGet" or method == "HttpGetAsync" or method == "GetAsync" then
+    elseif method == "GetObjects" then
+        if type(url) == "string" and (sfind(url, "http://", 1, true) or sfind(url, "https://", 1, true)) then
             local blocked, tag = isBlocked(url, nil, nil, false)
             if blocked then
                 logBlock(tag, url)
-                return ""
+                return {}
             end
-            local result = oldNamecall(self, ...)
-            if type(result) == "string" then
-                return sanitizeBody(result, getHost(urlDecode(url)))
+            if Cfg._verbose_soft_warnings then
+                _warn("GetObjects called with an external URL: " .. _tostring(url))
             end
-            return result
-
-        elseif method == "GetObjects" then
-            if type(url) == "string" and (sfind(url, "http://", 1, true) or sfind(url, "https://", 1, true)) then
-                local blocked, tag = isBlocked(url, nil, nil, false)
-                if blocked then
-                    logBlock(tag, url)
-                    return {}
-                end
-                if getgenv()._verbose_soft_warnings then
-                    _warn("GetObjects called with an external URL: " .. _tostring(url))
-                end
-            end
-            return oldNamecall(self, ...)
-
-        elseif method == "HttpPost" or method == "HttpPostAsync" or method == "PostAsync" then
-            local blocked, tag = isBlocked(url, body, nil, true)
-            if blocked then
-                logBlock(tag, url)
-                return ""
-            end
-            return oldNamecall(self, ...)
-
-        elseif method == "RequestAsync" and type(url) == "table" then
-            local reqUrl = url.Url or url.url
-            local reqBody = url.Body or url.body
-            local reqHeaders = url.Headers or url.headers
-            local reqMethod = string.upper(tostring(url.Method or "GET"))
-            local isPost = (reqMethod ~= "GET")
-            local blocked, tag = isBlocked(reqUrl, reqBody, reqHeaders, isPost)
-            if blocked then
-                logBlock(tag, reqUrl)
-                return {
-                    Success = false,
-                    StatusCode = 403,
-                    StatusMessage = "Blocked",
-                    Body = "",
-                    Headers = {}
-                }
-            end
-            local result = oldNamecall(self, ...)
-            if type(result) == "table" then
-                local newResult = {}
-                for k, v in pairs(result) do newResult[k] = v end
-                if newResult.Body then newResult.Body = sanitizeBody(newResult.Body, getHost(urlDecode(reqUrl))) end
-                if newResult.body then newResult.body = sanitizeBody(newResult.body, getHost(urlDecode(reqUrl))) end
-                return newResult
-            end
-            return result
         end
-
         return oldNamecall(self, ...)
+
+    elseif method == "HttpPost" or method == "HttpPostAsync" or method == "PostAsync" then
+        local blocked, tag = isBlocked(url, body, nil, true)
+        if blocked then
+            logBlock(tag, url)
+            return ""
+        end
+        return oldNamecall(self, ...)
+
+    elseif method == "RequestAsync" and type(url) == "table" then
+        local reqUrl = url.Url or url.url
+        local reqBody = url.Body or url.body
+        local reqHeaders = url.Headers or url.headers
+        local reqMethod = string.upper(tostring(url.Method or "GET"))
+        local isPost = (reqMethod ~= "GET")
+        local blocked, tag = isBlocked(reqUrl, reqBody, reqHeaders, isPost)
+        if blocked then
+            logBlock(tag, reqUrl)
+            return {
+                Success = false,
+                StatusCode = 403,
+                StatusMessage = "Blocked",
+                Body = "",
+                Headers = {}
+            }
+        end
+        local result = oldNamecall(self, ...)
+        if type(result) == "table" then
+            local newResult = {}
+            for k, v in pairs(result) do newResult[k] = v end
+            if newResult.Body then newResult.Body = sanitizeBody(newResult.Body, getHost(urlDecode(reqUrl))) end
+            if newResult.body then newResult.body = sanitizeBody(newResult.body, getHost(urlDecode(reqUrl))) end
+            return newResult
+        end
+        return result
+
+    elseif method == "ReportAbuse" and Cfg._anti_reportabuse and not checkcaller() then
+        logReportAbuse()
+        return
+    end
+
+    return oldNamecall(self, ...)
     end))
 end)
 
 if not namecallHookOk then
-    warn("CRITICAL: failed to install the __namecall hook. Error: " .. tostring(namecallHookErr))
+    warn("CRITICAL: failed to install the __namecall hook (Section 10). Error: " .. tostring(namecallHookErr))
 end
 
+local kickHookTarget
+
 local function checkActorEvasionRisk()
-    if not getgenv()._warn_actor_risk then return end
+    if not Cfg._warn_actor_risk then return end
 
     local ok = _pcall(function()
         local hasActorSupport = (type(getactors) == "function")
@@ -1668,28 +1662,33 @@ task.spawn(function()
     _pcall(checkActorEvasionRisk)
 end)
 
--- Player.Kick(player) (dot-call) does not go through __namecall.
--- Hooked with hookfunction; the __namecall hook above covers player:Kick().
-if getgenv()._anti_kick and type(hookfunction) == "function" and player then
+if Cfg._anti_kick then
     local kickHookOk, kickHookErr = pcall(function()
-        local origKick
-        origKick = hookfunction(player.Kick, newcclosure(function(self, ...)
-            if getgenv()._anti_kick and isLocalPlayer(self) then
+        local p = game:GetService("Players").LocalPlayer
+        local o = getrawmetatable(game)
+        local s = o.__namecall
+        local w = newcclosure(function(self, ...)
+            local m = getnamecallmethod()
+            if m == "Kick" and self == p and Cfg._anti_kick then
                 logKick()
                 return
             end
-            return origKick(self, ...)
-        end))
+            return s(self, ...)
+        end)
+        setreadonly(o, false)
+        o.__namecall = w
+        setreadonly(o, true)
+        kickHookTarget = w
     end)
 
     if not kickHookOk then
-        warn("Could not hook Player.Kick for dot-calls (player:Kick() is still blocked). Error: " .. tostring(kickHookErr))
+        warn("Failed to install the anti-kick hook. Error: " .. tostring(kickHookErr))
     end
 end
 
 local function wrapExecutorRequest(fn)
     if type(fn) ~= "function" then return fn end
-    return newcclosure(function(opts, ...)
+    return function(opts, ...)
         if type(opts) ~= "table" then return fn(opts, ...) end
         local reqUrl = opts.Url or opts.URL or opts.url
         local reqBody = opts.Body or opts.body
@@ -1711,7 +1710,7 @@ local function wrapExecutorRequest(fn)
             return newResult
         end
         return result
-    end)
+    end
 end
 
 local HookStatus = {}
@@ -1739,7 +1738,6 @@ end
 tryHookGlobal("request", function() return request end, function(w) getgenv().request = w; _G.request = w end)
 tryHookGlobal("http_request", function() return http_request end, function(w) getgenv().http_request = w; _G.http_request = w end)
 tryHookGlobal("syn.request", function() return syn and syn.request end, function(w) syn.request = w end)
-tryHookGlobal("http.request", function() return http and http.request end, function(w) http.request = w end)
 tryHookGlobal("Fluxus.request", function() return Fluxus and Fluxus.request end, function(w) Fluxus.request = w end)
 tryHookGlobal("KRNL_LOADED.request", function() return KRNL_LOADED and KRNL_LOADED.request end, function(w) KRNL_LOADED.request = w end)
 
@@ -1755,9 +1753,16 @@ if type(WebSocket) == "table" and type(WebSocket.connect) == "function" then
         if sock and type(sock) == "table" and type(sock.Send) == "function" then
             local origSend = sock.Send
             local function newSend(self, message)
-                if type(message) == "string" and sfind(slower(message), COOKIE_SIG, 1, true) then
-                    logBlock("STEALER", url)
-                    return
+                -- Added (point 5): run the full filter + sanitizer on every
+                -- outbound frame, not just a cookie-signature check. A socket is
+                -- treated as a POST channel to the connected URL.
+                if type(message) == "string" then
+                    local blk, btag = isBlocked(url, message, nil, true)
+                    if blk then
+                        logBlock(btag or "STEALER", url)
+                        return
+                    end
+                    message = sanitizeBody(message, getHost(urlDecode(url)))
                 end
                 return origSend(self, message)
             end
@@ -1768,12 +1773,69 @@ if type(WebSocket) == "table" and type(WebSocket.connect) == "function" then
     pcall(function() WebSocket.connect = newConnect end)
 end
 
+-- =========================================================================
+-- Added (point 7): guard non-network exfiltration channels.
+--
+-- Covers clipboard (setclipboard / toclipboard) and disk (writefile).
+-- Blocks only on HARD credential signatures (cookie / auth ticket) to keep
+-- false positives near zero — legitimate scripts copy text and write config
+-- or image files constantly. The script's own PNG writes use the saved
+-- original reference (see downloadImage), so they are never affected.
+-- =========================================================================
+do
+    if Cfg._block_clipboard_exfil then
+        local clipTargets = {
+            { name = "setclipboard",
+              get = function() return setclipboard end,
+              set = function(w) getgenv().setclipboard = w; _G.setclipboard = w end },
+            { name = "toclipboard",
+              get = function() return toclipboard end,
+              set = function(w) getgenv().toclipboard = w; _G.toclipboard = w end },
+        }
+        for _, t in ipairs(clipTargets) do
+            local ok, fn = pcall(t.get)
+            if ok and type(fn) == "function" then
+                local orig = fn
+                local wrapped = function(data, ...)
+                    local bad, why
+                    if Cfg._block_clipboard_exfil then bad, why = payloadHasHardCredential(data) end
+                    if bad then
+                        logExfil("clipboard (" .. t.name .. ")", why)
+                        return
+                    end
+                    return orig(data, ...)
+                end
+                pcall(t.set, wrapped)
+            end
+        end
+    end
+
+    if Cfg._block_writefile_exfil then
+        local ok, origWrite = pcall(function() return writefile end)
+        if ok and type(origWrite) == "function" then
+            -- Preserve the real function so the script's own image writes bypass
+            -- the guard (referenced by downloadImage).
+            genv.__BloxScannerOrigWritefile = origWrite
+            local wrapped = function(path, data, ...)
+                local bad, why
+                if Cfg._block_writefile_exfil then bad, why = payloadHasHardCredential(data) end
+                if bad then
+                    logExfil("writefile", why .. " → " .. tostring(path))
+                    return
+                end
+                return origWrite(path, data, ...)
+            end
+            pcall(function() getgenv().writefile = wrapped; _G.writefile = wrapped end)
+        end
+    end
+end
+
 local protectedFunctions = {}
 
-if getgenv()._anti_reportabuse and type(hookfunction) == "function" then
+if Cfg._anti_reportabuse and type(hookfunction) == "function" then
     local ok, origReportAbuse = pcall(function()
         return hookfunction(Players.ReportAbuse, newcclosure(function(self, ...)
-            if not checkcaller() then
+            if Cfg._anti_reportabuse and not checkcaller() then
                 logReportAbuse()
                 return
             end
@@ -1787,7 +1849,7 @@ if getgenv()._anti_reportabuse and type(hookfunction) == "function" then
     end
 end
 
-if getgenv()._anti_robux_prompt and type(hookfunction) == "function" then
+if Cfg._anti_robux_prompt and type(hookfunction) == "function" then
     local robuxMethods = {
         "PromptPurchase", "PromptGamePassPurchase", "PromptProductPurchase",
         "PromptBundlePurchase", "PromptPremiumPurchase", "PromptSubscriptionPurchase",
@@ -1795,12 +1857,12 @@ if getgenv()._anti_robux_prompt and type(hookfunction) == "function" then
     }
 
     for _, methodName in ipairs(robuxMethods) do
-        local target = Market[methodName]
-        if type(target) == "function" then
+        local hasTarget, target = pcall(function() return Market[methodName] end)
+        if hasTarget and type(target) == "function" then
             local ok, origFn = pcall(function()
                 return hookfunction(target, newcclosure(function(self, ...)
 
-                    if checkcaller() or isCallFromRealGameScript() then
+                    if not Cfg._anti_robux_prompt or checkcaller() or isCallFromRealGameScript() then
                         return protectedFunctions[methodName].orig(self, ...)
                     end
 
@@ -1832,17 +1894,17 @@ if getgenv()._anti_robux_prompt and type(hookfunction) == "function" then
     end
 end
 
-if getgenv()._anti_afk then
+if Cfg._anti_afk then
     local antiAfkOk, antiAfkErr = pcall(function()
         local VirtualUser = game:GetService("VirtualUser")
         local plr = game:GetService("Players").LocalPlayer
 
-        if getgenv().__BloxScannerAntiAfk then
-            pcall(function() getgenv().__BloxScannerAntiAfk:Disconnect() end)
-            getgenv().__BloxScannerAntiAfk = nil
+        if genv.__BloxScannerAntiAfk then
+            pcall(function() genv.__BloxScannerAntiAfk:Disconnect() end)
+            genv.__BloxScannerAntiAfk = nil
         end
 
-        getgenv().__BloxScannerAntiAfk = plr.Idled:Connect(function()
+        genv.__BloxScannerAntiAfk = plr.Idled:Connect(function()
 
             pcall(function()
                 VirtualUser:CaptureController()
@@ -1856,24 +1918,16 @@ if getgenv()._anti_afk then
     end
 end
 
-getgenv().BloxScannerUnload = function()
-    local flags = {
-        "_blockwebhook", "_sanitize_ip", "_anti_kick", "_log_blocks",
-        "_anti_reportabuse", "_anti_robux_prompt", "_block_bare_ip",
-        "_block_relay_hosts", "_strict_webhook", "_game_context_aware",
-        "_warn_actor_risk", "_anti_afk",
-        "_verbose_soft_warnings", "_scan_loadstring", "_strict_identity",
-    }
-    for _, f in ipairs(flags) do
-        getgenv()[f] = false
+genv.BloxScannerUnload = function()
+    -- Flip the switch every hook reads (Cfg returns false while not alive).
+    -- The user's own flags in getgenv() are left untouched, so a re-run
+    -- brings the scanner back with the same settings.
+    State.alive = false
+
+    if genv.__BloxScannerAntiAfk then
+        pcall(function() genv.__BloxScannerAntiAfk:Disconnect() end)
+        genv.__BloxScannerAntiAfk = nil
     end
 
-    if getgenv().__BloxScannerAntiAfk then
-        pcall(function() getgenv().__BloxScannerAntiAfk:Disconnect() end)
-        getgenv().__BloxScannerAntiAfk = nil
-    end
-
-    getgenv().__BloxScannerLoaded = nil
-    warn("Unloaded. All checks are now disabled. Rejoin to fully remove installed hooks.")
+    warn("Unloaded. All checks are now disabled. Run the script again to re-enable, or rejoin to fully remove hooks.")
 end
-
