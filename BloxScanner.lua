@@ -2,6 +2,9 @@
 
 
 
+
+
+
       █████╗  ██╗   ██╗ ██████╗   █████╗  ████████╗
      ██╔══██╗ ╚██╗ ██╔╝ ██╔══██╗ ██╔══██╗ ╚══██╔══╝
      ███████║  ╚████╔╝  ██████╔╝ ███████║    ██║
@@ -12,10 +15,13 @@
 
 
 
+
+
+
 ]]
 -- ===== Your settings (everything else is in DEFAULTS below) =====
-getgenv()._anti_reportabuse = true
-getgenv()._anti_robux_prompt = true
+getgenv()._anti_reportabuse = false
+getgenv()._anti_robux_prompt = false
 getgenv()._whitelist = {
     "roblox.com",
     "rbxcdn.com",
