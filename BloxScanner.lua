@@ -1,14 +1,20 @@
-
 --[[
-  █████╗  ██╗   ██╗ ██████╗   █████╗  ████████╗
- ██╔══██╗ ╚██╗ ██╔╝ ██╔══██╗ ██╔══██╗ ╚══██╔══╝
- ███████║  ╚████╔╝  ██████╔╝ ███████║    ██║
- ██╔══██║   ╚██╔╝   ██╔══██╗ ██╔══██║    ██║
- ██║  ██║    ██║    ██████╔╝ ██║  ██║    ██║
- ╚═╝  ╚═╝    ╚═╝    ╚═════╝  ╚═╝  ╚═╝    ╚═╝
-]]
 
--- ===== Your settings (everything else is in DEFAULTS below) =====getgenv()._anti_reportabuse = true
+
+
+      █████╗  ██╗   ██╗ ██████╗   █████╗  ████████╗
+     ██╔══██╗ ╚██╗ ██╔╝ ██╔══██╗ ██╔══██╗ ╚══██╔══╝
+     ███████║  ╚████╔╝  ██████╔╝ ███████║    ██║
+     ██╔══██║   ╚██╔╝   ██╔══██╗ ██╔══██║    ██║
+     ██║  ██║    ██║    ██████╔╝ ██║  ██║    ██║
+     ╚═╝  ╚═╝    ╚═╝    ╚═════╝  ╚═╝  ╚═╝    ╚═╝
+
+
+
+
+]]
+-- ===== Your settings (everything else is in DEFAULTS below) =====
+getgenv()._anti_reportabuse = true
 getgenv()._anti_robux_prompt = true
 getgenv()._whitelist = {
     "roblox.com",
@@ -22,7 +28,9 @@ getgenv()._Scripts_whitelist = {
     "https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source",
 }
 
-getgenv()._icon_asset = "rbxassetid://83768500686029"
+-- Icon: a direct link to a PNG/JPEG, or an asset id such as
+-- "rbxassetid://83768500686029". If a link fails, that asset id is used.
+getgenv()._icon_asset = "https://kappa.lol/eZqOim"
 -- ================================================================
 
 local genv = getgenv()
@@ -678,7 +686,14 @@ local function isForgivenByGameContext(word)
     return GameContextWords[word:lower()] == true
 end
 
-local imageCounter = 0
+local DEFAULT_ICON_ASSET = "rbxassetid://83768500686029"
+local ICON_FOLDER = "BloxScanner"
+
+-- Captured now, before request/writefile get wrapped further down.
+local rawRequest = http_request or (syn and syn.request) or request
+
+local iconCache = {}    -- url -> asset string, or false if loading failed
+local iconPending = {}  -- url -> true while a download is in flight
 
 local function ensureFolder(path)
     pcall(function()
@@ -688,50 +703,71 @@ local function ensureFolder(path)
     end)
 end
 
-local function autoDeleteFile(filepath)
-    task.delay(10, function()
-        pcall(function()
-            if isfile(filepath) then
-                delfile(filepath)
-            end
-        end)
-    end)
+-- Roblox ImageLabel only understands PNG and JPEG, so anything else
+-- (an HTML page, WebP, GIF) is rejected instead of written to disk.
+local function imageExtension(data)
+    if type(data) ~= "string" or #data < 12 then return nil end
+    if data:sub(1, 8) == "\137PNG\r\n\26\n" then return "png" end
+    if data:sub(1, 3) == "\255\216\255" then return "jpg" end
+    return nil
 end
 
+-- Short stable file name for a URL.
+local function urlKey(url)
+    local h = 5381
+    for i = 1, #url do h = (h * 33 + url:byte(i)) % 4294967296 end
+    return string.format("%08x", h)
+end
+
+local function toAsset(path)
+    local f = getcustomasset or getsynasset or (syn and syn.crypt and syn.crypt.customasset)
+    if not f then return nil end
+    local ok, asset = pcall(f, path)
+    if ok and type(asset) == "string" and asset ~= "" then return asset end
+    return nil
+end
+
+-- URL -> file in ./workspace/BloxScanner -> getcustomasset(). Runs once per
+-- URL per session; the result is cached. Returns nil on any failure.
 local function downloadImage(url)
-    if isBlocked and type(isBlocked) == "function" then
-        local blocked = isBlocked(url, nil, nil, false)
-        if blocked then
-            warn("downloadImage: URL blocked by filter, icon not loaded: " .. tostring(url))
-            return nil
-        end
+    if iconPending[url] then
+        local t0 = os.clock()
+        while iconPending[url] and os.clock() - t0 < 8 do task.wait() end
     end
+    local cached = iconCache[url]
+    if cached ~= nil then return cached or nil end
 
-    local req = http_request or (syn and syn.request) or request
-    if not req then return nil end
+    iconPending[url] = true
+    local result = false
 
-    local folderPath = "./temp/img"
-    ensureFolder(folderPath)
-    imageCounter = imageCounter + 1
-    local filename = folderPath .. "/" .. imageCounter .. ".png"
+    local ok = pcall(function()
+        if type(isBlocked) == "function" and isBlocked(url, nil, nil, false) then
+            warn("downloadImage: URL blocked by filter, icon not loaded: " .. tostring(url))
+            return
+        end
+        if not rawRequest then return end
 
-    local success, res = pcall(function()
-        return req({Url = url, Method = "GET"}).Body
+        local reqOk, res = pcall(rawRequest, { Url = url, Method = "GET" })
+        local body = reqOk and type(res) == "table" and res.Body or nil
+        local ext = imageExtension(body)
+        if not ext then
+            warn("downloadImage: the link is not a direct PNG/JPEG image, using the default icon: " .. tostring(url))
+            return
+        end
+
+        ensureFolder(ICON_FOLDER)
+        local path = ICON_FOLDER .. "/icon_" .. urlKey(url) .. "." .. ext
+        -- writefile may be wrapped later; use the original so our own image
+        -- writes are never second-guessed by the exfiltration guard.
+        local w = genv.__BloxScannerOrigWritefile or writefile
+        if not pcall(w, path, body) then return end
+
+        result = toAsset(path) or false
     end)
 
-    if success and res then
-        -- Added (point 7): writefile is wrapped later; use the original saved
-        -- reference so our own PNG writes are never second-guessed by the guard.
-        local w = genv.__BloxScannerOrigWritefile or writefile
-        pcall(function() w(filename, res) end)
-        autoDeleteFile(filename)
-        if getcustomasset then
-            return getcustomasset(filename)
-        elseif syn and syn.crypt and syn.crypt.customasset then
-            return syn.crypt.customasset(filename)
-        end
-    end
-    return nil
+    iconCache[url] = ok and result or false
+    iconPending[url] = nil
+    return iconCache[url] or nil
 end
 
 local CONFIG = {
@@ -754,8 +790,14 @@ local CONFIG = {
     MIN_HEIGHT = 55,
     TOAST_HEIGHT_FULL = 77,
     TOAST_HEIGHT_SMALL = 55,
-    DEFAULT_ICON = Cfg._icon_asset or "rbxassetid://83768500686029",
+    DEFAULT_ICON = Cfg._icon_asset or DEFAULT_ICON_ASSET,
 }
+
+-- If the icon is a link, fetch it in the background now so the first toast
+-- does not have to wait for the download.
+if type(CONFIG.DEFAULT_ICON) == "string" and CONFIG.DEFAULT_ICON:match("^https?://") then
+    task.spawn(downloadImage, CONFIG.DEFAULT_ICON)
+end
 
 local currentToast = nil
 local _lastToastKey = nil
@@ -893,15 +935,13 @@ local function NotifyToast(config)
         local isAsset = type(config.icon) == "string" and (config.icon:match("^rbxassetid://") or config.icon:match("^rbxasset://")) or type(config.icon) == "number"
 
         if isUrl then
-            local asset = downloadImage(config.icon)
-            if asset then
-                iconObj = Instance.new("ImageLabel")
-                iconObj.Image = asset
-                iconObj.BackgroundTransparency = 1
-                iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
-                iconObj.LayoutOrder = 1
-                iconObj.Parent = innerFrame
-            end
+            local asset = downloadImage(config.icon) or DEFAULT_ICON_ASSET
+            iconObj = Instance.new("ImageLabel")
+            iconObj.Image = asset
+            iconObj.BackgroundTransparency = 1
+            iconObj.Size = UDim2.new(0, CONFIG.ICON_SIZE, 0, CONFIG.ICON_SIZE)
+            iconObj.LayoutOrder = 1
+            iconObj.Parent = innerFrame
         elseif isAsset then
             local id = type(config.icon) == "number" and "rbxassetid://" .. config.icon or config.icon
             iconObj = Instance.new("ImageLabel")
