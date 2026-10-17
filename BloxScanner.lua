@@ -19,9 +19,12 @@
 
 
 ]]
+
+-- :) i love you, thank you for using script
+
 -- ===== Your settings (everything else is in DEFAULTS below) =====
-getgenv()._anti_reportabuse = false
-getgenv()._anti_robux_prompt = false
+getgenv()._anti_reportabuse = true
+getgenv()._anti_robux_prompt = true
 getgenv()._whitelist = {
     "roblox.com",
     "rbxcdn.com",
@@ -95,12 +98,18 @@ local Cfg = setmetatable({}, {
     end,
 })
 
+-- Wait for the game so Players.LocalPlayer exists even from autoexec.
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+-- Not every executor ships cloneref.
+local cloneref = cloneref or function(instance) return instance end
+
 local realGame = cloneref(game)
 local HttpService = cloneref(game:GetService("HttpService"))
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local TweenService = game:GetService("TweenService")
-local CoreGui = game:GetService("CoreGui")
+local okCoreGui, CoreGui = pcall(game.GetService, game, "CoreGui")
 local Market = game:GetService("MarketplaceService")
 
 local function safeClone(fn, fallback)
@@ -201,28 +210,23 @@ local BLACKLIST = {
     "ip-collect", "ip-sniff", "ip-harvest", "ip-capture", "ip-gather",
     "ip-api", "ipify", "apiip", "ipwho", "ipinfo", "ipgeolocation", "ipdata",
     "ipapi", "ipstack", "ip2location", "maxmind", "db-ip", "country.is",
-    "ipxapi", "radar", "whoisxmlapi", "geoapify", "iplocate", "iptrackertool",
-    "api-ninjas", "apifreaks", "geo.ipify", "findip", "freeipapi", "neutrinoapi",
-    "hackertarget", "api.ip.sb", "ipinfodb", "getgeoapi", "geoplugin", "ipregistry",
-    "abstractapi", "extreme-ip-lookup", "geolocation-db", "checkip.amazonaws",
+    "ipxapi", "iplocate", "iptrackertool",
+    "geo.ipify", "findip", "freeipapi",     "hackertarget", "api.ip.sb", "ipinfodb", "getgeoapi", "geoplugin", "ipregistry",
+    "extreme-ip-lookup", "geolocation-db", "checkip.amazonaws",
     "api.myip", "wtfismyip", "icanhazip", "ifconfig", "ident.me", "httpbin.org",
-    "abuseipdb", "virustotal", "otx.alienvault", "threatcrowd", "urlscan",
-    "whatismyipaddress", "myip.ms", "ip-detect", "ipchicken", "ip-address.org",
+        "whatismyipaddress", "myip.ms", "ip-detect", "ipchicken", "ip-address.org",
     "ip-score", "ipqualityscore", "scamalytics", "ipscore", "ipintel",
-    "ipblacklist", "dnslytics", "viewdns", "yougetsignal", "iplocation.net",
-    "geotargeting", "geobytes", "geocode", "maps.googleapis",
-    "nominatim.openstreetmap", "ipvigilante", "ip-geolocation.io", "ip-api.io",
+    "ipblacklist", "iplocation.net",
+    "geobytes",     "ipvigilante", "ip-geolocation.io", "ip-api.io",
     "ip-info.io", "ip-lookup.net", "ip-details.com", "ip-tracker.org",
     "iplogger.com.ua", "iplogger.org.ua", "iplogger.net", "ip-logger.com",
     "logip.net", "trackip.net", "ip-tracker.net", "ipgrabber", "ipgraber",
     "iplis.ru", "iplog.co", "maper.info", "ps3cfw.com", "wl.gl", "bc.ax",
     "ed.tc", "ezstat.ru", "02ip.ru", "browserleaks", "whoer", "ipleak",
-    "canarytokens", "roproxy",
-    "roware.space", "globalcheats.cc", "darkscripts", "egorikusa",
+    "canarytokens",     "roware.space", "globalcheats.cc", "darkscripts", "egorikusa",
     "hookbin", "pipedream", "webhook-test.com",
     "webhook.site", "webhook.in", "hook.io",
-    "pushover.net", "ntfy.sh", "gotify.net", "matrix.org",
-    "requestbin", "leancoding", "beeceptor", "requestcatcher", "run.mocky.io",
+        "requestbin", "leancoding", "beeceptor", "requestcatcher", "run.mocky.io",
 }
 
 local SuspiciousTLDs = { "tk", "ml", "ga", "cf", "gq" }
@@ -631,6 +635,8 @@ local CodeBlacklistSoft = {
 }
 
 local CodeSignaturePatterns = {
+    -- Lure used by public stealer loaders to push you into a fresh server.
+    { pattern = "server is unsupported%.%.%.%s*try in a new public server", label = "stealer lure kick message", hard = true },
     { pattern = "webhook%s*=%s*[\"']", label = "webhook assignment", hard = false },
     { pattern = "%d+%.%d+%.%d+%.%d+:%d+/", label = "raw IP:port URL", hard = false },
 }
@@ -833,7 +839,12 @@ local function NotifyToast(config)
     screenGui.AutoLocalize = false
     screenGui.ResetOnSpawn = false
     screenGui.ScreenInsets = Enum.ScreenInsets.None
-    screenGui.Parent = CoreGui
+    local parented = pcall(function()
+        screenGui.Parent = (type(gethui) == "function" and gethui()) or CoreGui
+    end)
+    if not parented or not screenGui.Parent then
+        pcall(function() screenGui.Parent = player:FindFirstChildOfClass("PlayerGui") end)
+    end
 
     currentToast = screenGui
 
@@ -1031,8 +1042,34 @@ local function NotifyToast(config)
     end)
 end
 
+-- Toasts are fired from inside hooks (request, namecall, loadstring). Run them
+-- on their own thread so a slow icon download or a GUI error can never stall
+-- or break the hooked call.
+local NotifyToastRaw = NotifyToast
+NotifyToast = function(config)
+    task.spawn(function()
+        local ok, err = pcall(NotifyToastRaw, config)
+        if not ok then warn("Toast failed: " .. tostring(err)) end
+    end)
+end
+
+local lastLogged, lastLoggedCount = {}, 0
 local function logBlock(tag, url)
     if not Cfg._log_blocks then return end
+
+    -- The same request is often retried in a loop; print it once per 3 s.
+    local key = tag .. "|" .. tostring(url)
+    local now = os.clock()
+    if lastLogged[key] and now - lastLogged[key] < 3 then
+        lastWebhookReason = nil
+        return
+    end
+    lastLoggedCount = lastLoggedCount + 1
+    if lastLoggedCount > 200 then
+        lastLogged, lastLoggedCount = {}, 0
+    end
+    lastLogged[key] = now
+
     local source = getCallingScriptName()
 
     local consoleTitle
@@ -1043,6 +1080,8 @@ local function logBlock(tag, url)
         consoleTitle = "WEBHOOK RELAY (heuristic) - BLOCKED"
     elseif tag == "BARE_IP" then
         consoleTitle = "RAW IP ENDPOINT - BLOCKED"
+    elseif tag == "C2" then
+        consoleTitle = "SUSPICIOUS ENDPOINT (heuristic) - BLOCKED"
     else
         consoleTitle = "IP LOGGER - BLOCKED"
     end
@@ -1148,14 +1187,78 @@ end
 -- Added (point 7): hard-signature test for raw credential payloads.
 -- Kept deliberately narrow (cookie / auth ticket only) so legitimate
 -- clipboard copies and config/image writes are not false-flagged.
+-- Discord user / MFA tokens (shape: 3 dot-separated base64url parts).
+-- JWTs are deliberately not matched: many legitimate hubs ship Supabase /
+-- Firebase keys in that format.
+local function findSecretToken(s)
+    if type(s) ~= "string" or #s < 40 or #s > 200000 then return nil end
+    if sfind(s, "mfa.", 1, true) then
+        for tok in s:gmatch("mfa%.[%w_%-]+") do
+            if #tok >= 80 then return "Discord MFA token" end
+        end
+    end
+    if sfind(s, ".", 1, true) then
+        for a, b, c in s:gmatch("([%w_%-]+)%.([%w_%-]+)%.([%w_%-]+)") do
+            if #a >= 23 and #a <= 28 and (#b == 6 or #b == 7) and #c >= 27 and #c <= 40 then
+                return "Discord token"
+            end
+        end
+    end
+    return nil
+end
+
+-- Undo the cheap string tricks stealers use to hide a signature from a plain
+-- substring scan: \xNN, \NNN, \u{NN}, \z, zero-width characters,
+-- string.char(...), ("..."):reverse() and, with joinLiterals, "a".."b"
+-- splits. Bounded to 3 passes and skipped for very large sources.
+local function normalizeCode(s, joinLiterals)
+    if #s > 400000 then return s end
+    for _ = 1, 3 do
+        local before = s
+        s = gsub(s, "\\x(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+        s = gsub(s, "\\(%d%d?%d?)", function(d)
+            local n = tonumber(d)
+            if n and n >= 32 and n <= 126 then return string.char(n) end
+        end)
+        s = gsub(s, "\\u%{(%x+)%}", function(h)
+            local n = tonumber(h, 16)
+            if n and n >= 32 and n <= 126 then return string.char(n) end
+        end)
+        s = gsub(s, "\\z%s*", "")
+        s = gsub(s, "\226\128[\139\140\141]", "")
+        s = gsub(s, "\239\187\191", "")
+        s = gsub(s, "string%.char%s*%(([%d%s,]+)%)", function(list)
+            local out = {}
+            for n in list:gmatch("%d+") do
+                n = tonumber(n)
+                if n > 255 then return nil end
+                out[#out + 1] = string.char(n)
+            end
+            if #out == 0 then return nil end
+            return '"' .. table.concat(out) .. '"'
+        end)
+        s = gsub(s, "%(%s*([\"'])([^\"'\n]*)%1%s*%)%s*:%s*reverse%s*%(%s*%)", function(q, inner)
+            return q .. inner:reverse() .. q
+        end)
+        if joinLiterals then
+            s = gsub(s, "[\"']%s*%.%.%s*[\"']", "")
+        end
+        if s == before then break end
+    end
+    return s
+end
+
 local function payloadHasHardCredential(s)
     if type(s) ~= "string" or s == "" then return false, nil end
+    if #s > 1000000 then s = s:sub(1, 1000000) end
     local low = slower(s)
     if sfind(low, COOKIE_SIG, 1, true) then return true, "roblox cookie signature" end
     if sfind(low, "roblosecur" .. "ity", 1, true) then return true, "roblox cookie" end
     if sfind(low, "getauthticket", 1, true) or sfind(low, "authticket", 1, true) then
         return true, "auth ticket"
     end
+    local tokenKind = findSecretToken(s)
+    if tokenKind then return true, tokenKind end
     return false, nil
 end
 
@@ -1191,6 +1294,57 @@ local function bodyLeaksLocationFields(body)
     return scanForLocationFields(decoded)
 end
 
+local DynDnsSuffixes = {
+    "duckdns.org", "no-ip.org", "no-ip.com", "no-ip.biz", "ddns.net", "hopto.org",
+    "zapto.org", "sytes.net", "myftp.org", "servegame.com", "bounceme.net",
+    "redirectme.net", "serveblog.net", "freeddns.org", "dynu.net", "dynu.com",
+    "ddnsking.com", "mooo.com",
+}
+
+-- Scores a destination on weak signals that are only convincing together:
+-- odd port, punycode label, dynamic-DNS host, random-looking label, and the
+-- request sending data (POST). A request is blocked at 3 or more points, so
+-- one oddity alone (a custom port, say) never blocks anything.
+local function c2Score(dUrl, host, isPost)
+    local score, why = 0, {}
+    local authority = smatch(dUrl, "^%w[%w%+%.%-]*://([^/?#]+)") or ""
+    authority = smatch(authority, "@(.+)$") or authority
+    local port = smatch(authority, ":(%d+)$")
+    if port and port ~= "80" and port ~= "443" then
+        score = score + 1
+        why[#why + 1] = "non-standard port " .. port
+    end
+    for label in host:gmatch("[^%.]+") do
+        if label:sub(1, 4) == "xn--" then
+            score = score + 2
+            why[#why + 1] = "punycode host"
+            break
+        end
+    end
+    for _, suffix in ipairs(DynDnsSuffixes) do
+        if hostMatches(host, suffix) then
+            score = score + 2
+            why[#why + 1] = "dynamic-DNS host"
+            break
+        end
+    end
+    for label in host:gmatch("[^%.]+") do
+        if #label >= 14 then
+            local _, vowels = gsub(label, "[aeiouy]", "")
+            if vowels / #label < 0.2 then
+                score = score + 1
+                why[#why + 1] = "random-looking host name"
+                break
+            end
+        end
+    end
+    if isPost then
+        score = score + 1
+        why[#why + 1] = "sends data"
+    end
+    return score, table.concat(why, ", ")
+end
+
 isBlocked = function(url, body, headers, isPost)
     if not State.alive then return false, nil end
     if type(url) ~= "string" or url == "" then return false, nil end
@@ -1213,11 +1367,21 @@ isBlocked = function(url, body, headers, isPost)
         return false, nil
     end
 
+    do
+        local kind = findSecretToken(type(body) == "string" and body or "") or findSecretToken(dUrl)
+        if kind then
+            lastWebhookReason = "outgoing " .. kind
+            return true, "STEALER"
+        end
+    end
+
     if isExactBlacklisted(host) then
+        lastWebhookReason = "domain is on the known logger / phishing list"
         return true, "LOGGER"
     end
 
     if KnownExfilHosts[host] then
+        lastWebhookReason = "known stealer relay host"
         return true, "STEALER"
     end
 
@@ -1302,10 +1466,12 @@ isBlocked = function(url, body, headers, isPost)
 
     for _, p in ipairs(BLACKLIST) do
         if hostMatches(host, p) then
+            lastWebhookReason = 'host matches blacklist entry "' .. p .. '"'
             return true, "LOGGER"
         end
         for _, label in ipairs(hostLabels) do
             if label == p then
+                lastWebhookReason = 'host label matches blacklist entry "' .. p .. '"'
                 return true, "LOGGER"
             end
         end
@@ -1314,6 +1480,7 @@ isBlocked = function(url, body, headers, isPost)
     for _, label in ipairs(hostLabels) do
         for _, p in ipairs(BLACKLIST_LABEL_SUBSTRING) do
             if sfind(label, p, 1, true) then
+                lastWebhookReason = 'host label contains "' .. p .. '"'
                 return true, "LOGGER"
             end
         end
@@ -1321,15 +1488,26 @@ isBlocked = function(url, body, headers, isPost)
 
     for _, tld in ipairs(SuspiciousTLDs) do
         if hostMatches(host, tld) then
+            lastWebhookReason = 'free-hosting TLD ".' .. tld .. '"'
             return true, "LOGGER"
         end
     end
 
+    do
+        local score, why = c2Score(dUrl, host, isPost)
+        if score >= 3 then
+            lastWebhookReason = "several weak signals: " .. why
+            return true, "C2"
+        end
+    end
+
     if hasSuspiciousHeaders(headers) then
+        lastWebhookReason = "request headers reveal your IP"
         return true, "STEALER"
     end
 
     if bodyLeaksLocationFields(body) then
+        lastWebhookReason = "request body carries location / IP fields"
         return true, "LOGGER"
     end
 
@@ -1411,6 +1589,14 @@ end
 local function sanitizeBody(bodyStr, host)
     if type(bodyStr) ~= "string" or bodyStr == "" then return bodyStr end
     if not Cfg._sanitize_ip then return bodyStr end
+
+    -- IP-echo / geolocation answers are tiny. Large bodies and anything that
+    -- looks like Lua source (a script fetched with HttpGet) are returned
+    -- untouched: rewriting them is slow and could corrupt the code.
+    if #bodyStr > 65536 or sfind(bodyStr, "\nlocal ", 1, true)
+       or sfind(bodyStr, "function(", 1, true) or sfind(bodyStr, "function ", 1, true) then
+        return bodyStr
+    end
 
     if host and isWhitelisted(host) then return bodyStr end
 
@@ -1496,6 +1682,9 @@ end
 -- game:HttpGet. loadstring() skips the scan for exactly this text.
 local TrustedSources = {}
 
+-- Functions we hooked. restorefunction() on any of them is refused.
+local protectedTargets = setmetatable({}, { __mode = "k" })
+
 local function isTrustedScriptUrl(url)
     if type(url) ~= "string" then return false end
     for _, u in ipairs(Cfg._Scripts_whitelist or {}) do
@@ -1522,16 +1711,43 @@ end
 
 if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
     local origLoadstring
+    protectedTargets[loadstring] = true
     origLoadstring = hookfunction(loadstring, newcclosure(function(code, chunkname)
         if not Cfg._scan_loadstring or TrustedSources[code] then
             return origLoadstring(code, chunkname)
         end
-        local codeStr = tostring(code):lower()
+        local rawStr = tostring(code)
+        local codeStr = rawStr:lower()
         local source = getCallingScriptName()
 
         for _, word in ipairs(CodeBlacklistHard) do
             if sfind(codeStr, word, 1, true) then
                 return blockCode(source, 'hard signature "' .. word .. '"')
+            end
+        end
+
+        -- Same hard signatures, but after undoing escape / char-code / split
+        -- tricks. A hit here that the plain text did not show means the
+        -- signature was deliberately hidden.
+        if sfind(rawStr, "\\", 1, true) or sfind(rawStr, "string.char", 1, true)
+           or sfind(rawStr, "\226\128", 1, true) or sfind(rawStr, "\239\187\191", 1, true)
+           or sfind(rawStr, "reverse", 1, true) or sfind(rawStr, "[\"']%s*%.%.%s*[\"']") then
+            local norm = normalizeCode(rawStr, false):lower()
+            if norm ~= codeStr then
+                for _, word in ipairs(CodeBlacklistHard) do
+                    if sfind(norm, word, 1, true) then
+                        return blockCode(source, 'hard signature hidden by encoding "' .. word .. '"')
+                    end
+                end
+            end
+            -- Joining "a".."b" is only used for the webhook-URL check: this
+            -- script itself splits its own signatures that way, so joining
+            -- them for the hard list would flag BloxScanner.
+            local joined = normalizeCode(rawStr, true):lower()
+            for _, hook in ipairs({ "discord.com/api/webhooks", "discordapp.com/api/webhooks" }) do
+                if sfind(joined, hook, 1, true) and not sfind(codeStr, hook, 1, true) then
+                    return blockCode(source, "webhook URL hidden by encoding")
+                end
             end
         end
 
@@ -1580,10 +1796,21 @@ if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
     end))
 end
 
+-- The __namecall hook runs for every method call on every Instance in the
+-- game, so anything unrelated must be passed straight through.
+local WATCHED_METHODS = {
+    HttpGet = true, HttpGetAsync = true, GetAsync = true, GetObjects = true,
+    HttpPost = true, HttpPostAsync = true, PostAsync = true,
+    RequestAsync = true, ReportAbuse = true,
+}
+
 local oldNamecall
 local namecallHookOk, namecallHookErr = pcall(function()
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
     local method = getnamecallmethod()
+    if not WATCHED_METHODS[method] then
+        return oldNamecall(self, ...)
+    end
     local args = { ... }
     local url = args[1]
     local body = args[2]
@@ -1887,6 +2114,7 @@ local protectedFunctions = {}
 
 if Cfg._anti_reportabuse and type(hookfunction) == "function" then
     local ok, origReportAbuse = pcall(function()
+        protectedTargets[Players.ReportAbuse] = true
         return hookfunction(Players.ReportAbuse, newcclosure(function(self, ...)
             if Cfg._anti_reportabuse and not checkcaller() then
                 logReportAbuse()
@@ -1913,6 +2141,7 @@ if Cfg._anti_robux_prompt and type(hookfunction) == "function" then
         local hasTarget, target = pcall(function() return Market[methodName] end)
         if hasTarget and type(target) == "function" then
             local ok, origFn = pcall(function()
+                protectedTargets[target] = true
                 return hookfunction(target, newcclosure(function(self, ...)
 
                     if not Cfg._anti_robux_prompt or checkcaller() or isCallFromRealGameScript() then
@@ -1958,7 +2187,7 @@ if Cfg._anti_afk then
         end
 
         genv.__BloxScannerAntiAfk = plr.Idled:Connect(function()
-
+            if not Cfg._anti_afk then return end
             pcall(function()
                 VirtualUser:CaptureController()
                 VirtualUser:ClickButton2(Vector2.new())
@@ -1971,16 +2200,24 @@ if Cfg._anti_afk then
     end
 end
 
+if type(restorefunction) == "function" and hookfunction then
+    pcall(function()
+        local origRestore
+        origRestore = hookfunction(restorefunction, newcclosure(function(fn, ...)
+            if State.alive and protectedTargets[fn] then
+                warn("[ HOOK PROTECTION ] A script tried to remove a BloxScanner hook; blocked. Source: " .. getCallingScriptName())
+                return
+            end
+            return origRestore(fn, ...)
+        end))
+    end)
+end
+
 genv.BloxScannerUnload = function()
     -- Flip the switch every hook reads (Cfg returns false while not alive).
     -- The user's own flags in getgenv() are left untouched, so a re-run
     -- brings the scanner back with the same settings.
     State.alive = false
-
-    if genv.__BloxScannerAntiAfk then
-        pcall(function() genv.__BloxScannerAntiAfk:Disconnect() end)
-        genv.__BloxScannerAntiAfk = nil
-    end
 
     warn("Unloaded. All checks are now disabled. Run the script again to re-enable, or rejoin to fully remove hooks.")
 end
