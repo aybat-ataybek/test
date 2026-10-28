@@ -20,6 +20,15 @@
 
 ]]
 
+
+
+
+
+
+
+
+
+
 -- :) i love you, thank you for using script
 
 -- ===== Your settings (everything else is in DEFAULTS below) =====
@@ -58,6 +67,7 @@ if State then
 end
 State = { alive = true }
 genv.__BloxScannerState = State
+State.version = "2.1"
 genv.__BloxScannerLoaded = true
 
 -- All options live here. Set any of them in getgenv() BEFORE running the
@@ -101,8 +111,10 @@ local Cfg = setmetatable({}, {
 -- Wait for the game so Players.LocalPlayer exists even from autoexec.
 if not game:IsLoaded() then game.Loaded:Wait() end
 
--- Not every executor ships cloneref.
+-- Not every executor ships these helpers.
 local cloneref = cloneref or function(instance) return instance end
+local newcclosure = newcclosure or function(f) return f end
+local checkcaller = checkcaller or function() return false end
 
 local realGame = cloneref(game)
 local HttpService = cloneref(game:GetService("HttpService"))
@@ -145,11 +157,24 @@ local function urlDecode(s)
     return ok and out or s
 end
 
+local function decodeEscapes(s)
+    if type(s) ~= "string" or #s > 8000000 or not sfind(s, "\\", 1, true) then return s end
+    local ok, out = pcall(function()
+        s = gsub(s, "\\u(%x%x%x%x)", function(h)
+            local n = tonumber(h, 16)
+            if n and n < 128 then return string.char(n) end
+        end)
+        s = gsub(s, "\\x(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+        return s
+    end)
+    return ok and out or s
+end
+
 local function getHost(url)
     if type(url) ~= "string" then return "" end
     local rest = gsub(url, "^%w[%w%+%.%-]*://", "")
-    local authority = smatch(rest, "^([^/?#]+)") or rest
-    authority = smatch(authority, "@(.+)$") or authority
+    local authority = smatch(rest, "^([^/\\?#]+)") or rest
+    authority = smatch(authority, "^.*@(.*)$") or authority
     local host = smatch(authority, "^([^:]+)") or authority
     host = gsub(host, "%.$", "")
     return slower(host)
@@ -228,6 +253,11 @@ local BLACKLIST = {
     "webhook.site", "webhook.in", "hook.io",
         "requestbin", "leancoding", "beeceptor", "requestcatcher", "run.mocky.io",
 }
+
+local BlacklistSet = {}
+for _, entry in ipairs(BLACKLIST) do
+    BlacklistSet[entry] = true
+end
 
 local SuspiciousTLDs = { "tk", "ml", "ga", "cf", "gq" }
 
@@ -761,6 +791,10 @@ local function downloadImage(url)
 
         local reqOk, res = pcall(rawRequest, { Url = url, Method = "GET" })
         local body = reqOk and type(res) == "table" and res.Body or nil
+        if type(body) == "string" and #body > 2097152 then
+            warn("downloadImage: image is larger than 2 MB, using the default icon: " .. tostring(url))
+            return
+        end
         local ext = imageExtension(body)
         if not ext then
             warn("downloadImage: the link is not a direct PNG/JPEG image, using the default icon: " .. tostring(url))
@@ -777,6 +811,9 @@ local function downloadImage(url)
         result = toAsset(path) or false
     end)
 
+    local cacheSize = 0
+    for _ in pairs(iconCache) do cacheSize = cacheSize + 1 end
+    if cacheSize >= 8 then iconCache = {} end
     iconCache[url] = ok and result or false
     iconPending[url] = nil
     return iconCache[url] or nil
@@ -1046,7 +1083,17 @@ end
 -- on their own thread so a slow icon download or a GUI error can never stall
 -- or break the hooked call.
 local NotifyToastRaw = NotifyToast
+local lastToastAt, toastTimes = {}, {}
 NotifyToast = function(config)
+    local key = tostring(type(config) == "table" and config.title)
+    local now = os.clock()
+    if lastToastAt[key] and now - lastToastAt[key] < 2 then return end
+    lastToastAt[key] = now
+    for index = #toastTimes, 1, -1 do
+        if now - toastTimes[index] > 6 then table.remove(toastTimes, index) end
+    end
+    if #toastTimes >= 4 then return end
+    toastTimes[#toastTimes + 1] = now
     task.spawn(function()
         local ok, err = pcall(NotifyToastRaw, config)
         if not ok then warn("Toast failed: " .. tostring(err)) end
@@ -1054,7 +1101,26 @@ NotifyToast = function(config)
 end
 
 local lastLogged, lastLoggedCount = {}, 0
+-- Last 50 blocks, newest last: State.log (getgenv().__BloxScannerState.log).
+-- Handy for false-positive reports: each entry has time, tag, url, reason.
+State.log = {}
+
+local function recordBlock(tag, url)
+    local log = State.log
+    local last = log[#log]
+    local urlText = tostring(url)
+    if last and last.tag == tag and last.url == urlText then return end
+    log[#log + 1] = {
+        time = os.date("%H:%M:%S"),
+        tag = tag,
+        url = urlText,
+        reason = lastWebhookReason,
+    }
+    if #log > 50 then table.remove(log, 1) end
+end
+
 local function logBlock(tag, url)
+    recordBlock(tag, url)
     if not Cfg._log_blocks then return end
 
     -- The same request is often retried in a loop; print it once per 3 s.
@@ -1248,6 +1314,18 @@ local function normalizeCode(s, joinLiterals)
     return s
 end
 
+local function normalizeLarge(s, joinLiterals)
+    if #s <= 400000 then return normalizeCode(s, joinLiterals) end
+    if #s > 16000000 then return s end
+    local parts = {}
+    local pos = 1
+    while pos <= #s do
+        parts[#parts + 1] = normalizeCode(s:sub(pos, pos + 201999), joinLiterals)
+        pos = pos + 200000
+    end
+    return table.concat(parts, "\n")
+end
+
 local function payloadHasHardCredential(s)
     if type(s) ~= "string" or s == "" then return false, nil end
     if #s > 1000000 then s = s:sub(1, 1000000) end
@@ -1354,10 +1432,15 @@ isBlocked = function(url, body, headers, isPost)
     local ul = slower(dUrl)
     local pl = slower(path)
     local bl = slower(type(body) == "string" and urlDecode(body) or "")
+    local bd = ""
+    if type(body) == "string" and sfind(body, "\\", 1, true) then
+        bd = slower(decodeEscapes(urlDecode(body)))
+    end
 
     local COOKIE_SIG_WORD_2 = "roblosecur" .. "ity"
     if sfind(ul, COOKIE_SIG, 1, true) or sfind(ul, COOKIE_SIG_WORD_2, 1, true) or
-       sfind(bl, COOKIE_SIG, 1, true) or sfind(bl, COOKIE_SIG_WORD_2, 1, true) then
+       sfind(bl, COOKIE_SIG, 1, true) or sfind(bl, COOKIE_SIG_WORD_2, 1, true) or
+       (bd ~= "" and (sfind(bd, COOKIE_SIG, 1, true) or sfind(bd, COOKIE_SIG_WORD_2, 1, true))) then
         if not hostMatches(host, "roblox.com") then
             return true, "STEALER"
         end
@@ -1464,16 +1547,23 @@ isBlocked = function(url, body, headers, isPost)
         hostLabels[#hostLabels + 1] = label
     end
 
-    for _, p in ipairs(BLACKLIST) do
-        if hostMatches(host, p) then
-            lastWebhookReason = 'host matches blacklist entry "' .. p .. '"'
+    for _, label in ipairs(hostLabels) do
+        if BlacklistSet[label] then
+            lastWebhookReason = 'host label matches blacklist entry "' .. label .. '"'
             return true, "LOGGER"
         end
-        for _, label in ipairs(hostLabels) do
-            if label == p then
-                lastWebhookReason = 'host label matches blacklist entry "' .. p .. '"'
+    end
+
+    do
+        local suffix = host
+        while suffix ~= "" do
+            if BlacklistSet[suffix] then
+                lastWebhookReason = 'host matches blacklist entry "' .. suffix .. '"'
                 return true, "LOGGER"
             end
+            local dot = sfind(suffix, ".", 1, true)
+            if not dot then break end
+            suffix = suffix:sub(dot + 1)
         end
     end
 
@@ -1671,7 +1761,7 @@ local function sanitizeBody(bodyStr, host)
 
     if stashN > 0 then
         for token, val in pairs(stash) do
-            out = out:gsub(token, val)
+            out = out:gsub(token, function() return val end)
         end
     end
 
@@ -1682,8 +1772,6 @@ end
 -- game:HttpGet. loadstring() skips the scan for exactly this text.
 local TrustedSources = {}
 
--- Functions we hooked. restorefunction() on any of them is refused.
-local protectedTargets = setmetatable({}, { __mode = "k" })
 
 local function isTrustedScriptUrl(url)
     if type(url) ~= "string" then return false end
@@ -1709,9 +1797,10 @@ local function blockCode(source, reason)
     return newcclosure(function() end)
 end
 
+local loadstringStatus = "off"
 if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
+    local loadstringOk, loadstringErr = pcall(function()
     local origLoadstring
-    protectedTargets[loadstring] = true
     origLoadstring = hookfunction(loadstring, newcclosure(function(code, chunkname)
         if not Cfg._scan_loadstring or TrustedSources[code] then
             return origLoadstring(code, chunkname)
@@ -1732,7 +1821,7 @@ if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
         if sfind(rawStr, "\\", 1, true) or sfind(rawStr, "string.char", 1, true)
            or sfind(rawStr, "\226\128", 1, true) or sfind(rawStr, "\239\187\191", 1, true)
            or sfind(rawStr, "reverse", 1, true) or sfind(rawStr, "[\"']%s*%.%.%s*[\"']") then
-            local norm = normalizeCode(rawStr, false):lower()
+            local norm = normalizeLarge(rawStr, false):lower()
             if norm ~= codeStr then
                 for _, word in ipairs(CodeBlacklistHard) do
                     if sfind(norm, word, 1, true) then
@@ -1743,7 +1832,7 @@ if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
             -- Joining "a".."b" is only used for the webhook-URL check: this
             -- script itself splits its own signatures that way, so joining
             -- them for the hard list would flag BloxScanner.
-            local joined = normalizeCode(rawStr, true):lower()
+            local joined = normalizeLarge(rawStr, true):lower()
             for _, hook in ipairs({ "discord.com/api/webhooks", "discordapp.com/api/webhooks" }) do
                 if sfind(joined, hook, 1, true) and not sfind(codeStr, hook, 1, true) then
                     return blockCode(source, "webhook URL hidden by encoding")
@@ -1794,6 +1883,8 @@ if Cfg._scan_loadstring and hookfunction and type(loadstring) == "function" then
 
         return origLoadstring(code, chunkname)
     end))
+    end)
+    loadstringStatus = loadstringOk and "ok" or ("failed: " .. tostring(loadstringErr))
 end
 
 -- The __namecall hook runs for every method call on every Instance in the
@@ -1806,8 +1897,20 @@ local WATCHED_METHODS = {
 
 local oldNamecall
 local namecallHookOk, namecallHookErr = pcall(function()
+    assert(type(hookmetamethod) == "function", "hookmetamethod is not available")
+    assert(type(getnamecallmethod) == "function", "getnamecallmethod is not available")
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
     local method = getnamecallmethod()
+    if method == "Kick" then
+        -- Anti-kick lives in this same hook: a second layer on __namecall
+        -- (raw metatable write on top of hookmetamethod) is what can make
+        -- executors recurse forever on teleport.
+        if Cfg._anti_kick and self == Players.LocalPlayer then
+            logKick()
+            return
+        end
+        return oldNamecall(self, ...)
+    end
     if not WATCHED_METHODS[method] then
         return oldNamecall(self, ...)
     end
@@ -1906,7 +2009,6 @@ if not namecallHookOk then
     warn("CRITICAL: failed to install the __namecall hook (Section 10). Error: " .. tostring(namecallHookErr))
 end
 
-local kickHookTarget
 
 local function checkActorEvasionRisk()
     if not Cfg._warn_actor_risk then return end
@@ -1942,29 +2044,6 @@ task.spawn(function()
     _pcall(checkActorEvasionRisk)
 end)
 
-if Cfg._anti_kick then
-    local kickHookOk, kickHookErr = pcall(function()
-        local p = game:GetService("Players").LocalPlayer
-        local o = getrawmetatable(game)
-        local s = o.__namecall
-        local w = newcclosure(function(self, ...)
-            local m = getnamecallmethod()
-            if m == "Kick" and self == p and Cfg._anti_kick then
-                logKick()
-                return
-            end
-            return s(self, ...)
-        end)
-        setreadonly(o, false)
-        o.__namecall = w
-        setreadonly(o, true)
-        kickHookTarget = w
-    end)
-
-    if not kickHookOk then
-        warn("Failed to install the anti-kick hook. Error: " .. tostring(kickHookErr))
-    end
-end
 
 local function wrapExecutorRequest(fn)
     if type(fn) ~= "function" then return fn end
@@ -1998,20 +2077,20 @@ local HookStatus = {}
 local function tryHookGlobal(name, getter, setter)
     local ok, fn = pcall(getter)
     if not ok or type(fn) ~= "function" then
-        HookStatus[name] = "не найдена"
+        HookStatus[name] = "not found"
         return
     end
     local wrapped = wrapExecutorRequest(fn)
     local applied = pcall(setter, wrapped)
     if not applied then
-        HookStatus[name] = "ошибка установки"
+        HookStatus[name] = "install error"
         return
     end
     local verifyOk, current = pcall(getter)
     if verifyOk and current == wrapped then
         HookStatus[name] = "ok"
     else
-        HookStatus[name] = "не применилось (возможно readonly)"
+        HookStatus[name] = "not applied (read-only?)"
     end
 end
 
@@ -2114,7 +2193,6 @@ local protectedFunctions = {}
 
 if Cfg._anti_reportabuse and type(hookfunction) == "function" then
     local ok, origReportAbuse = pcall(function()
-        protectedTargets[Players.ReportAbuse] = true
         return hookfunction(Players.ReportAbuse, newcclosure(function(self, ...)
             if Cfg._anti_reportabuse and not checkcaller() then
                 logReportAbuse()
@@ -2141,7 +2219,6 @@ if Cfg._anti_robux_prompt and type(hookfunction) == "function" then
         local hasTarget, target = pcall(function() return Market[methodName] end)
         if hasTarget and type(target) == "function" then
             local ok, origFn = pcall(function()
-                protectedTargets[target] = true
                 return hookfunction(target, newcclosure(function(self, ...)
 
                     if not Cfg._anti_robux_prompt or checkcaller() or isCallFromRealGameScript() then
@@ -2200,17 +2277,25 @@ if Cfg._anti_afk then
     end
 end
 
-if type(restorefunction) == "function" and hookfunction then
-    pcall(function()
-        local origRestore
-        origRestore = hookfunction(restorefunction, newcclosure(function(fn, ...)
-            if State.alive and protectedTargets[fn] then
-                warn("[ HOOK PROTECTION ] A script tried to remove a BloxScanner hook; blocked. Source: " .. getCallingScriptName())
-                return
-            end
-            return origRestore(fn, ...)
-        end))
-    end)
+HookStatus["__namecall"] = namecallHookOk and "ok" or "failed"
+HookStatus["loadstring"] = loadstringStatus
+HookStatus["ReportAbuse"] = protectedFunctions.ReportAbuse and "ok" or "off"
+do
+    local purchaseHooks = 0
+    for name in pairs(protectedFunctions) do
+        if name ~= "ReportAbuse" then purchaseHooks = purchaseHooks + 1 end
+    end
+    HookStatus["purchase prompts"] = purchaseHooks > 0 and ("ok (" .. purchaseHooks .. ")") or "off"
+end
+
+genv.BloxScannerStatus = HookStatus
+do
+    local names = {}
+    for name in pairs(HookStatus) do names[#names + 1] = name end
+    table.sort(names)
+    local parts = {}
+    for _, name in ipairs(names) do parts[#parts + 1] = name .. ": " .. tostring(HookStatus[name]) end
+    print("[BloxScanner v" .. tostring(State.version) .. "] ready | " .. table.concat(parts, " | "))
 end
 
 genv.BloxScannerUnload = function()
