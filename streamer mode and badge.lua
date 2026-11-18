@@ -1,153 +1,73 @@
 local Players = game:GetService("Players")
-local TextChatService = game:GetService("TextChatService")
-local Workspace = game:GetService("Workspace")
+local TextChat = game:GetService("TextChatService")
 
-local ENV = getgenv()
+local env = getgenv()
+local lp = Players.LocalPlayer
+local realName, realDisplay = lp.Name, lp.DisplayName
 
-ENV.FakeName = ENV.FakeName or ".test"
-ENV.FakeDisplay = ENV.FakeDisplay or ".test"
-ENV.Badge = ENV.Badge or "roblox-plus"
+env.FakeName = env.FakeName or ".test"
+env.FakeDisplay = env.FakeDisplay or ".test"
+env.Badge = env.Badge or "roblox-plus"
+env.NameColor = env.NameColor or "#FFFFFF"
+env.DisplayColor = env.DisplayColor or "#FFFFFF"
+env.BadgeColor = env.BadgeColor or "#0066FF"
 
-ENV.NameColor = ENV.NameColor or "#FFFFFF"
-ENV.DisplayColor = ENV.DisplayColor or "#FFFFFF"
-ENV.BadgeColor = ENV.BadgeColor or "#0066FF"
+local ICONS = "rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json"
+local BADGES = { ["roblox-plus"] = true, ["premium"] = true, ["verified-mono"] = true }
 
-local function validColor(color, fallback)
-    if type(color) == "string"
-        and color:match("^#%x%x%x%x%x%x$") then
-        return color
-    end
-
-    return fallback
+local function hex(c, default)
+    return tostring(c):match("^#%x%x%x%x%x%x$") and c or default
 end
 
-local CONFIG = {
-    IconFont = "rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json",
-    Separator = " "
-}
-
-local BADGES = {
-    ["roblox-plus"] = "roblox-plus",
-    ["premium"] = "premium",
-    ["verified-mono"] = "verified-mono"
-}
-
-local LocalPlayer = Players.LocalPlayer
-local RealName = LocalPlayer.Name
-local RealDisplay = LocalPlayer.DisplayName
-
-local function escapeRichText(text)
-    return tostring(text)
-        :gsub("&", "&amp;")
-        :gsub("<", "&lt;")
-        :gsub(">", "&gt;")
-        :gsub('"', "&quot;")
-        :gsub("'", "&apos;")
+local function esc(s)
+    return (tostring(s):gsub("[&<>\"']", {
+        ["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;",
+        ['"'] = "&quot;", ["'"] = "&apos;",
+    }))
 end
 
-local function coloredText(text, color)
-    color = validColor(color, "#FFFFFF")
-
-    return '<font color="' .. color .. '">'
-        .. escapeRichText(text)
-        .. '</font>'
+local function colored(text, color)
+    return ('<font color="%s">%s</font>'):format(color, esc(text))
 end
 
-local function badgeText(name)
-    local badge = BADGES[ENV.Badge] or BADGES["roblox-plus"]
-    local nameColor = validColor(ENV.DisplayColor, "#FFFFFF")
-    local badgeColor = validColor(ENV.BadgeColor, "#0066FF")
-
-    return '<font color="' .. nameColor .. '">'
-        .. escapeRichText(name)
-        .. '</font>'
-        .. CONFIG.Separator
-        .. '<font color="' .. badgeColor
-        .. '" family="' .. CONFIG.IconFont
-        .. '"><b>' .. escapeRichText(badge)
-        .. '</b></font>'
+local function badged(text)
+    local badge = BADGES[env.Badge] and env.Badge or "roblox-plus"
+    return colored(text, hex(env.DisplayColor, "#FFFFFF")) .. " "
+        .. ('<font color="%s" family="%s"><b>%s</b></font>'):format(hex(env.BadgeColor, "#0066FF"), ICONS, badge)
 end
 
-local function replaceNames(text)
-    if not text or text == "" then
+local function pat(s)
+    return (s:gsub("%W", "%%%0"))
+end
+
+local function swap(text)
+    if text:find(env.FakeDisplay, 1, true) or text:find(env.FakeName, 1, true) then
         return text
     end
+    if text == realDisplay then return badged(env.FakeDisplay) end
+    if text == realName then return colored(env.FakeName, hex(env.NameColor, "#FFFFFF")) end
 
-    if text:find(ENV.FakeDisplay, 1, true)
-        or text:find(ENV.FakeName, 1, true) then
-        return text
+    local out = text:gsub(pat(realDisplay), function() return badged(env.FakeDisplay) end)
+    if out == text then
+        out = text:gsub(pat(realName), function() return colored(env.FakeName, hex(env.NameColor, "#FFFFFF")) end)
     end
-
-    if text == RealDisplay then
-        return badgeText(ENV.FakeDisplay)
-    end
-
-    if text == RealName then
-        return coloredText(ENV.FakeName, ENV.NameColor)
-    end
-
-    local result = text
-
-    if RealDisplay ~= "" then
-        local escapedDisplay = RealDisplay:gsub(
-            "([^%w])",
-            "%%%1"
-        )
-
-        result = result:gsub(escapedDisplay, function()
-            return badgeText(ENV.FakeDisplay)
-        end)
-    end
-
-    if result == text and RealName ~= "" then
-        local escapedName = RealName:gsub(
-            "([^%w])",
-            "%%%1"
-        )
-
-        result = result:gsub(escapedName, function()
-            return coloredText(ENV.FakeName, ENV.NameColor)
-        end)
-    end
-
-    return result
+    return out
 end
 
-local function monitorText(obj)
-    if not (
-        obj:IsA("TextLabel")
-        or obj:IsA("TextButton")
-        or obj:IsA("TextBox")
-    ) then
-        return
-    end
-
-    if obj:GetAttribute("ROMUMonitor") then
-        return
-    end
-
+local function hook(obj)
+    if not (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then return end
+    if obj:GetAttribute("ROMUMonitor") then return end
     obj:SetAttribute("ROMUMonitor", true)
 
-    local updating = false
-
+    local busy = false
     local function update()
-        if updating or not obj.Parent then
-            return
-        end
-
-        local original = obj.Text
-
-        if original == "" then
-            return
-        end
-
-        local updated = replaceNames(original)
-
-        if updated ~= original then
-            updating = true
+        if busy or obj.Text == "" then return end
+        local new = swap(obj.Text)
+        if new ~= obj.Text then
+            busy = true
             obj.RichText = true
-            obj.Text = updated
-            updating = false
+            obj.Text = new
+            busy = false
         end
     end
 
@@ -155,86 +75,21 @@ local function monitorText(obj)
     obj:GetPropertyChangedSignal("Text"):Connect(update)
 end
 
-local function scanGui(root)
-    for _, obj in ipairs(root:GetDescendants()) do
-        monitorText(obj)
-    end
-
-    root.DescendantAdded:Connect(monitorText)
+local function watch(root)
+    for _, v in root:GetDescendants() do hook(v) end
+    root.DescendantAdded:Connect(hook)
 end
 
-scanGui(LocalPlayer:WaitForChild("PlayerGui"))
+watch(lp:WaitForChild("PlayerGui"))
+watch(workspace) -- nametags, billboards, characters
+pcall(watch, game:GetService("CoreGui"))
 
 pcall(function()
-    scanGui(game:GetService("CoreGui"))
-end)
-
-local function monitorBillboard(billboard)
-    if billboard:GetAttribute("ROMUBillboardMonitor") then
-        return
-    end
-
-    billboard:SetAttribute("ROMUBillboardMonitor", true)
-
-    for _, obj in ipairs(billboard:GetDescendants()) do
-        monitorText(obj)
-    end
-
-    billboard.DescendantAdded:Connect(monitorText)
-end
-
-for _, obj in ipairs(Workspace:GetDescendants()) do
-    if obj:IsA("BillboardGui") then
-        monitorBillboard(obj)
-    end
-end
-
-Workspace.DescendantAdded:Connect(function(obj)
-    if obj:IsA("BillboardGui") then
-        task.defer(function()
-            if obj.Parent then
-                monitorBillboard(obj)
-            end
-        end)
-    end
-end)
-
-local function monitorCharacter(character)
-    character:WaitForChild("Humanoid", 10)
-
-    for _, obj in ipairs(character:GetDescendants()) do
-        if obj:IsA("BillboardGui") then
-            monitorBillboard(obj)
-        else
-            monitorText(obj)
+    TextChat.OnIncomingMessage = function(msg)
+        if msg.TextSource and msg.TextSource.UserId == lp.UserId then
+            local p = Instance.new("TextChatMessageProperties")
+            p.PrefixText = badged(env.FakeDisplay)
+            return p
         end
-    end
-
-    character.DescendantAdded:Connect(function(obj)
-        if obj:IsA("BillboardGui") then
-            monitorBillboard(obj)
-        else
-            monitorText(obj)
-        end
-    end)
-end
-
-if LocalPlayer.Character then
-    task.spawn(monitorCharacter, LocalPlayer.Character)
-end
-
-LocalPlayer.CharacterAdded:Connect(monitorCharacter)
-
-pcall(function()
-    TextChatService.OnIncomingMessage = function(message)
-        if not message.TextSource
-            or message.TextSource.UserId ~= LocalPlayer.UserId then
-            return
-        end
-
-        local properties = Instance.new("TextChatMessageProperties")
-        properties.PrefixText = badgeText(ENV.FakeDisplay)
-
-        return properties
     end
 end)
